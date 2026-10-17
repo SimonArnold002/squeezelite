@@ -102,7 +102,10 @@ public class NowPlayingActivity extends AppCompatActivity {
         @Override
         public void onConnectionSuspended() {
             Utils.debug("");
-            releaseController();
+            // The player process went away. Disconnect, or connect() refuses to run again
+            // when the restarted player broadcasts that it is running.
+            disconnect();
+            showNotRunning();
         }
 
         @Override
@@ -227,6 +230,7 @@ public class NowPlayingActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         requestQueue.cancelAll(request -> true);
+        requestQueue.stop();
     }
 
     private void connect() {
@@ -239,11 +243,11 @@ public class NowPlayingActivity extends AppCompatActivity {
         }
     }
 
+    // Also when not (yet) connected: a browser left connecting would still bind and call
+    // onConnected later, and one left suspended refuses connect()
     private void disconnect() {
         releaseController();
-        if (browser.isConnected()) {
-            browser.disconnect();
-        }
+        browser.disconnect();
     }
 
     private void releaseController() {

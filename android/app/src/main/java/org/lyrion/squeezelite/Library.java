@@ -448,4 +448,6 @@ public class Library {
 
     private native void start(String lms, String mac, String name, int idleTimeout, int fixedVolume, int logging, int mobileNetwork, int streamBuffer, int openSlEs);
     private native void stop();
+    // The highest DSD rate the library sends to the DAC as DSD, 0 when DSD plays as PCM
+    public native int nativeDsdMaxRate();
 }

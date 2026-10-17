@@ -477,3 +477,14 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_stop(JNIEnv * env, jobject jobj) {
 	slimproto_stop();
 }
+
+// For the format line: the highest DSD bit rate sent to the DAC as DSD, 0 when DSD plays as
+// PCM (no FiiO encoding, or native output failed and fell back). Mirrors dsd.c, which converts
+// to PCM when the DSD_U16_LE frame rate (DSD rate / 16) is above supported_rates[0].
+JNIEXPORT jint JNICALL Java_org_lyrion_squeezelite_Library_nativeDsdMaxRate(JNIEnv * env, jobject jobj) {
+#if DSD
+	return output.dsdfmt == DSD_U16_LE ? (jint)(output.supported_rates[0] * 16) : 0;
+#else
+	return 0;
+#endif
+}

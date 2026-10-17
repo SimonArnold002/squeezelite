@@ -21,7 +21,6 @@
 package org.lyrion.squeezelite;
 
 import android.graphics.Bitmap;
-import android.media.AudioFormat;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -44,8 +43,6 @@ public class NowPlaying {
     // artist, album, duration, coverid, artwork url, remote stream title, is-remote, year,
     // type, samplerate, samplesize
     private static final String TAGS = "tags:aldcKNxyoTI";
-    // The native library sends DSD to the DAC when the firmware has FiiO's DSD encoding
-    private static final boolean NATIVE_DSD = hasDsdEncoding();
     // Let LMS settle on the new track, and coalesce a burst of events into a single query
     private static final long QUERY_DELAY = 250;
     // If LMS still reports the previous track then try again after this long
@@ -69,6 +66,7 @@ public class NowPlaying {
     private String coverUrl = null;
     private Bitmap cover = null;
     private MediaMetadataCompat.Builder metadata = null;
+    private String formatText = null;
     private String description = null;
 
     public NowPlaying(PlayerService service, Library lib, MediaSessionCompat session) {
@@ -144,11 +142,12 @@ public class NowPlaying {
         // Per-track for local files, but the status itself is better for remote streams
         double duration = track.optDouble("duration", result.optDouble("duration", 0));
         double time = result.optDouble("time", 0);
-        String url = coverUrl(track);
 
         // No artwork URL here - LMS mints a fresh coverid for a remote stream on every request,
         // so that would make each poll of a webradio look like a new track
         String key = title + " " + artist + " " + album + " " + duration;
+        String url = coverUrl(track, key);
+        String fmt = format(track);
         int newState = "play".equals(mode) ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
         boolean trackChanged = !key.equals(trackKey);
         boolean stateChanged = newState!=state;
@@ -164,8 +163,9 @@ public class NowPlaying {
                     .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, artist)
                     .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, album)
                     .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, url)
-                    .putString(FORMAT_KEY, format(track))
+                    .putString(FORMAT_KEY, fmt)
                     .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, (long)(duration*1000));
+            formatText = fmt;
             description = Utils.isEmpty(artist) ? title : (title + SEPARATOR + artist);
             if (!url.equals(coverUrl)) {
                 coverUrl = url;
@@ -174,6 +174,11 @@ public class NowPlaying {
             }
             publishMetadata();
             service.trackChanged();
+        } else if (null!=metadata && !fmt.equals(formatText)) {
+            // Native DSD fell back to PCM since the track began
+            formatText = fmt;
+            metadata.putString(FORMAT_KEY, fmt);
+            publishMetadata();
         }
 
         setState(newState, (long)(time*1000));
@@ -235,22 +240,15 @@ public class NowPlaying {
                                     .build());
     }
 
-    private static boolean hasDsdEncoding() {
-        try {
-            AudioFormat.class.getField("ENCODING_DSD_32BIT");
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
     // e.g. "DSD128 • native", "FLAC • 24-bit • 96 kHz", or just the type for a remote stream
-    private static String format(JSONObject track) {
+    private String format(JSONObject track) {
         String type = track.optString("type", "");
         int rate = track.optInt("samplerate", 0);
         int bits = track.optInt("samplesize", 0);
         if ("dsf".equals(type) || "dff".equals(type)) {
-            return (rate>=44100 ? "DSD" + (rate/44100) : "DSD") + SEPARATOR + (NATIVE_DSD ? "native" : "as PCM");
+            // The library decides per track, from the rate, whether the DAC gets DSD or PCM
+            boolean nativeDsd = rate>0 && rate<=lib.nativeDsdMaxRate();
+            return (rate>=44100 ? "DSD" + (rate/44100) : "DSD") + SEPARATOR + (nativeDsd ? "native" : "as PCM");
         }
         StringBuilder sb = new StringBuilder();
         switch (type) {
@@ -289,7 +287,7 @@ public class NowPlaying {
         });
     }
 
-    private String coverUrl(JSONObject track) {
+    private String coverUrl(JSONObject track, String trackKey) {
         String base = lib.getServerUrl();
         if (null==base) {
             return "";
@@ -304,9 +302,11 @@ public class NowPlaying {
         if (!Utils.isEmpty(coverId)) {
             return base + "music/" + coverId + "/cover.jpg";
         }
-        // Fall back to whatever LMS thinks this player's current cover is
+        // Fall back to whatever LMS thinks this player's current cover is. The URL is the same
+        // for every track, so tag it with the track: an unchanged URL is not fetched again.
         String mac = lib.getMac();
-        return Utils.isEmpty(mac) ? "" : (base + "music/current/cover.jpg?player=" + mac);
+        return Utils.isEmpty(mac) ? "" : (base + "music/current/cover.jpg?player=" + mac +
+                                          "&track=" + Integer.toHexString(trackKey.hashCode()));
     }
 
     private static String firstOf(JSONObject obj, String... keys) {

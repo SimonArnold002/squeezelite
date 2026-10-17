@@ -200,8 +200,12 @@ public class PlayerService extends MediaBrowserServiceCompat {
         }
         try {
             Intent intent = new Intent(this, NowPlayingActivity.class);
-            PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, intent,
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? PendingIntent.FLAG_MUTABLE : PendingIntent.FLAG_UPDATE_CURRENT);
+            // Back to the open screen, not another one on top of the settings screen
+            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            // CANCEL_CURRENT: a reused PendingIntent keeps the flags of the intent it was first
+            // made with (UPDATE_CURRENT only replaces extras), even one left by an older version
+            PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_CANCEL_CURRENT |
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? PendingIntent.FLAG_MUTABLE : 0));
             SharedPreferences prefs = Prefs.get(this);
             String name = Utils.isEmpty(playerName) ? prefs.getString(Prefs.PLAYER_NAME_KEY, Prefs.DEFAULT_PLAYER_NAME) : playerName;
             Intent quitIntent = new Intent(this, PlayerService.class);
