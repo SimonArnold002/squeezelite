@@ -634,30 +634,40 @@ static void dsd_pack(const u32_t *in, u8_t *out, frames_t frames) {
 	}
 }
 
+// called with the lock held. The DAC refused DSD: later tracks decode to PCM (dsd.c reads
+// output.dsdfmt at each track start), and the writer plays the rest of this one out as silence
+// so the timeline and LMS stay in step. Reopening DSD instead would fail the same way.
+static void dsd_fall_back(void) {
+	if (output.dsdfmt != PCM) {
+		LOG_ERROR("native DSD output failed: DSD plays as PCM until the player restarts");
+		output.dsdfmt = PCM;
+	}
+}
+
 static void *dsd_writer(void *arg) {
+	static u32_t frames_buf[DSD_CHUNK_FRAMES * 2]; // one writer at a time: dsd_writer_stop joins it
+	static u8_t packed[DSD_CHUNK_FRAMES * 4];
 	unsigned rate = pa.rate;                   // squeezelite frame rate: DSD bit rate / 16
-	u8_t *frames_buf = malloc(DSD_CHUNK_FRAMES * BYTES_PER_FRAME);
-	u8_t *packed = malloc(DSD_CHUNK_FRAMES * 4);
 	u64_t written = 0;                         // squeezelite frames handed to the track
 	bool reopen = false;
+	bool track = dsd_track_open(rate / 2, rate / 2 * 8 / 4, DSD_CHUNK_FRAMES * 4); // track rate = DSD / 32; 0.25s buffer
 
-	if (!frames_buf || !packed ||
-		!dsd_track_open(rate / 2, rate / 2 * 8 / 4, DSD_CHUNK_FRAMES * 4)) { // track rate = DSD / 32; 0.25s buffer
+	if (!track) {
 		LOG_ERROR("native DSD output failed to open at %u", rate);
-		free(frames_buf);
-		free(packed);
-		return NULL;
+		LOCK;
+		dsd_fall_back();
+		UNLOCK;
 	}
 
 	while (dsd_running) {
 		frames_t wanted = DSD_CHUNK_FRAMES, got;
-		u64_t played = (u64_t)dsd_track_position() * 2;
+		u64_t played = track ? (u64_t)dsd_track_position() * 2 : written;
 
 		LOCK;
 		output.device_frames = written > played ? (unsigned)(written - played) : 0;
 		output.updated = gettime_ms();
 		output.frames_played_dmp = output.frames_played;
-		optr = frames_buf;
+		optr = (u8_t *)frames_buf;
 		do {
 			got = _output_frames(wanted);
 			wanted -= got;
@@ -671,17 +681,22 @@ static void *dsd_writer(void *arg) {
 		}
 		UNLOCK;
 
-		dsd_pack((u32_t *)frames_buf, packed, DSD_CHUNK_FRAMES);
-		if (!dsd_track_write(packed, DSD_CHUNK_FRAMES * 4)) {
-			reopen = true;
+		if (track) {
+			dsd_pack(frames_buf, packed, DSD_CHUNK_FRAMES);
+			if (!dsd_track_write(packed, DSD_CHUNK_FRAMES * 4)) {
+				track = false;
+				LOCK;
+				dsd_fall_back();
+				UNLOCK;
+			}
+		} else {
+			usleep((u64_t)DSD_CHUNK_FRAMES * 1000000 / rate); // the time the chunk would have played
 		}
 		written += DSD_CHUNK_FRAMES;
 		if (reopen) break;
 	}
 
 	dsd_track_close();
-	free(frames_buf);
-	free(packed);
 
 	LOCK;
 	if (reopen && dsd_running) {

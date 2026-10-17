@@ -110,26 +110,45 @@ static int find_dsd_encoding(JNIEnv *env) {
 	return encoding;
 }
 
+// builder.name(arg), or NULL (exception cleared) when the method is missing or throws:
+// the Builder setters throw IllegalArgumentException for a value the firmware rejects
 static jobject call_builder(JNIEnv *env, jobject builder, const char *name, const char *ret, jint arg) {
 	jclass cls = (*env)->GetObjectClass(env, builder);
 	char sig[96];
 	snprintf(sig, sizeof(sig), "(I)%s", ret);
-	jobject next = (*env)->CallObjectMethod(env, builder, (*env)->GetMethodID(env, cls, name, sig), arg);
+	jmethodID id = (*env)->GetMethodID(env, cls, name, sig);
+	jobject next = NULL;
 	(*env)->DeleteLocalRef(env, cls);
+	if (jni_failed(env, name) || !id) return NULL;
+	next = (*env)->CallObjectMethod(env, builder, id, arg);
+	if (jni_failed(env, name)) return NULL;
 	return next;
 }
 
 static jobject build(JNIEnv *env, jobject builder, const char *sig) {
 	jclass cls = (*env)->GetObjectClass(env, builder);
-	jobject built = (*env)->CallObjectMethod(env, builder, (*env)->GetMethodID(env, cls, "build", sig));
+	jmethodID id = (*env)->GetMethodID(env, cls, "build", sig);
+	jobject built = NULL;
 	(*env)->DeleteLocalRef(env, cls);
+	if (jni_failed(env, "build") || !id) return NULL;
+	built = (*env)->CallObjectMethod(env, builder, id);
+	if (jni_failed(env, "build")) return NULL;
 	return built;
 }
 
+// a set... call on a builder; false when it failed
+static bool set(JNIEnv *env, jobject builder, const char *name, const char *ret, jint arg) {
+	jobject next = call_builder(env, builder, name, ret, arg);
+	if (!next) return false;
+	(*env)->DeleteLocalRef(env, next);
+	return true;
+}
+
+// local refs left behind on a failure are freed by DetachCurrentThread
 bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes) {
 	JNIEnv *env;
 	jclass cls;
-	jobject b, ret, attrs = NULL, format = NULL, track = NULL;
+	jobject b, attrs, format, track = NULL;
 
 	if (!jvm || !dsd_encoding) return false;
 	if ((*jvm)->AttachCurrentThread(jvm, &env, NULL) != JNI_OK) {
@@ -142,47 +161,36 @@ bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes) 
 	b = (*env)->NewObject(env, cls, (*env)->GetMethodID(env, cls, "<init>", "()V"));
 	(*env)->DeleteLocalRef(env, cls);
 	if (jni_failed(env, "AudioAttributes.Builder")) goto fail;
-	ret = call_builder(env, b, "setUsage", "Landroid/media/AudioAttributes$Builder;", 1); // USAGE_MEDIA
-	(*env)->DeleteLocalRef(env, ret);
-	ret = call_builder(env, b, "setContentType", "Landroid/media/AudioAttributes$Builder;", 2); // CONTENT_TYPE_MUSIC
-	(*env)->DeleteLocalRef(env, ret);
-	attrs = build(env, b, "()Landroid/media/AudioAttributes;");
+	if (!set(env, b, "setUsage", "Landroid/media/AudioAttributes$Builder;", 1) || // USAGE_MEDIA
+		!set(env, b, "setContentType", "Landroid/media/AudioAttributes$Builder;", 2) || // CONTENT_TYPE_MUSIC
+		!(attrs = build(env, b, "()Landroid/media/AudioAttributes;"))) goto fail;
 	(*env)->DeleteLocalRef(env, b);
-	if (jni_failed(env, "AudioAttributes")) goto fail;
 
 	cls = (*env)->FindClass(env, "android/media/AudioFormat$Builder");
 	b = (*env)->NewObject(env, cls, (*env)->GetMethodID(env, cls, "<init>", "()V"));
 	(*env)->DeleteLocalRef(env, cls);
 	if (jni_failed(env, "AudioFormat.Builder")) goto fail;
-	ret = call_builder(env, b, "setEncoding", "Landroid/media/AudioFormat$Builder;", dsd_encoding);
-	(*env)->DeleteLocalRef(env, ret);
-	ret = call_builder(env, b, "setSampleRate", "Landroid/media/AudioFormat$Builder;", rate);
-	(*env)->DeleteLocalRef(env, ret);
-	ret = call_builder(env, b, "setChannelMask", "Landroid/media/AudioFormat$Builder;", 0xC); // CHANNEL_OUT_STEREO
-	(*env)->DeleteLocalRef(env, ret);
-	format = build(env, b, "()Landroid/media/AudioFormat;");
+	if (!set(env, b, "setEncoding", "Landroid/media/AudioFormat$Builder;", dsd_encoding) ||
+		!set(env, b, "setSampleRate", "Landroid/media/AudioFormat$Builder;", rate) ||
+		!set(env, b, "setChannelMask", "Landroid/media/AudioFormat$Builder;", 0xC) || // CHANNEL_OUT_STEREO
+		!(format = build(env, b, "()Landroid/media/AudioFormat;"))) goto fail;
 	(*env)->DeleteLocalRef(env, b);
-	if (jni_failed(env, "AudioFormat")) goto fail;
 
 	cls = (*env)->FindClass(env, "android/media/AudioTrack");
 	track = (*env)->NewObject(env, cls, (*env)->GetMethodID(env, cls, "<init>",
 							  "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V"),
 							  attrs, format, (jint)buffer_bytes, 1 /* MODE_STREAM */, 0 /* AUDIO_SESSION_ID_GENERATE */);
-	if (jni_failed(env, "AudioTrack")) {
-		(*env)->DeleteLocalRef(env, cls);
-		goto fail;
-	}
+	if (jni_failed(env, "AudioTrack")) goto fail;
 	dsd_write_id = (*env)->GetMethodID(env, cls, "write", "([BII)I");
 	dsd_head_id = (*env)->GetMethodID(env, cls, "getPlaybackHeadPosition", "()I");
 	if ((*env)->CallIntMethod(env, track, (*env)->GetMethodID(env, cls, "getState", "()I")) != 1) { // STATE_INITIALIZED
-		(*env)->DeleteLocalRef(env, cls);
+		jni_failed(env, "getState");
 		LOG_ERROR("DSD AudioTrack: not initialised at %u", rate);
-		(*env)->CallVoidMethod(env, track, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, track), "release", "()V"));
 		goto fail;
 	}
 	(*env)->CallVoidMethod(env, track, (*env)->GetMethodID(env, cls, "play", "()V"));
-	(*env)->DeleteLocalRef(env, cls);
 	if (jni_failed(env, "play")) goto fail;
+	(*env)->DeleteLocalRef(env, cls);
 
 	dsd_track = (*env)->NewGlobalRef(env, track);
 	dsd_array = (*env)->NewGlobalRef(env, (*env)->NewByteArray(env, chunk_bytes));
@@ -194,9 +202,11 @@ bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes) 
 	return true;
 
 fail:
-	if (track) (*env)->DeleteLocalRef(env, track);
-	if (attrs) (*env)->DeleteLocalRef(env, attrs);
-	if (format) (*env)->DeleteLocalRef(env, format);
+	if (track) {
+		// release now: an unreleased track holds the DSD output until the GC finalizes it
+		(*env)->CallVoidMethod(env, track, (*env)->GetMethodID(env, cls, "release", "()V"));
+		jni_failed(env, "release");
+	}
 	(*jvm)->DetachCurrentThread(jvm);
 	dsd_env = NULL;
 	return false;
@@ -211,7 +221,7 @@ bool dsd_track_write(const u8_t *buf, unsigned len) {
 	while (done < len) {
 		jint n = (*env)->CallIntMethod(env, dsd_track, dsd_write_id, dsd_array, (jint)done, (jint)(len - done));
 		if (jni_failed(env, "write")) return false;
-		if (n < 0) {
+		if (n <= 0) { // 0 = the track was paused or stopped under us: never spin on it
 			LOG_ERROR("DSD AudioTrack: write error %d", n);
 			return false;
 		}
