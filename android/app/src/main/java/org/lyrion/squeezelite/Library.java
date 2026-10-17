@@ -189,7 +189,7 @@ public class Library {
               nameToUse,
               STREAM_IDLE_TIMEOUT,
               VOL_SEP==volumeControl ? 0 : 1,
-              LOG_ERROR,
+              LOG_lINFO, // DSD test build: was LOG_ERROR
               cellular || metered ? 1 : 0,
               streamBuffer,
               prefs.getBoolean(Prefs.USE_OPENSLES_KEY, Prefs.DEFAULT_USE_OPENSLES) ? 1 : 0));

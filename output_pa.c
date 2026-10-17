@@ -59,10 +59,20 @@ static unsigned paFramesPerBuffer = 4096;
 static unsigned paNumberOfBuffers = 4;
 #endif /* PA18API */
 
+#if defined(ANDROID) && DSD
+#define ANDROID_DSD 1
+#else
+#define ANDROID_DSD 0
+#endif
+
 // ouput device
 static struct {
 	unsigned rate;
 	PaStream *stream;
+#if ANDROID_DSD
+	u8_t fmt;        // output.outfmt the open stream or DSD track was opened for
+	bool dsd;        // a DSD writer thread owns the output instead of pa.stream
+#endif
 } pa;
 
 static log_level loglevel;
@@ -270,6 +280,11 @@ static void pa_stream_finished(void *userdata) {
 	}
 }
 
+#if ANDROID_DSD
+static void dsd_writer_start(void);
+static void dsd_writer_stop(void);
+#endif
+
 static thread_type monitor_thread;
 bool monitor_thread_running = false;
 
@@ -350,11 +365,24 @@ void _pa_open(void) {
 		LOCK;
 	}
 
+#if ANDROID_DSD
+	if (pa.dsd) {
+		dsd_writer_stop();
+	}
+#endif
+
 	if (output.state == OUTPUT_OFF) {
 		// we get called when transitioning to OUTPUT_OFF to create the probe thread
 		// set err to avoid opening device and logging messages
 		err = 1;
 
+#if ANDROID_DSD
+	} else if (output.outfmt == DSD_U16_LE) {
+		// native DSD goes to an AudioTrack, not portaudio
+		dsd_writer_start();
+		output.error_opening = false;
+		return;
+#endif
 	} else if ((device_id = pa_device_id(output.device)) == -1) {
 		LOG_INFO("device %s not found", output.device);
 		err = 1;
@@ -434,6 +462,9 @@ void _pa_open(void) {
 
 #endif
 		pa.rate = output.current_sample_rate;
+#if ANDROID_DSD
+		pa.fmt = output.outfmt;
+#endif
 
 #ifndef PA18API
 		if ((err = Pa_SetStreamFinishedCallback(pa.stream, pa_stream_finished)) != paNoError) {
@@ -498,7 +529,7 @@ static int _write_frames(frames_t out_frames, bool silence, s32_t gainL, s32_t g
 		IF_DSD(
 			if (output.outfmt != PCM) {
 				buf = silencebuf_dsd;
-				update_dop((u32_t *) buf, out_frames, false); // don't invert silence
+				if (output.outfmt == DOP) update_dop((u32_t *) buf, out_frames, false); // don't invert silence
 			}
 		)
 
@@ -540,6 +571,10 @@ static int pa_callback(void *pa_input, void *pa_output, unsigned long pa_frames_
 	do {
 		frames = _output_frames(pa_frames_wanted);
 		pa_frames_wanted -= frames;
+#if ANDROID_DSD
+		// the next track needs a different output: leave its frames for that one
+		if (pa.fmt != output.outfmt || pa.rate != output.current_sample_rate) break;
+#endif
 	} while (pa_frames_wanted > 0 && frames != 0);
 
 	if (pa_frames_wanted > 0) {
@@ -552,6 +587,10 @@ static int pa_callback(void *pa_input, void *pa_output, unsigned long pa_frames_
 		ret = paComplete;
 	} else if (pa.rate != output.current_sample_rate) {
 		ret = paComplete;
+#if ANDROID_DSD
+	} else if (pa.fmt != output.outfmt) {
+		ret = paComplete;
+#endif
 	} else {
 		ret = paContinue;
 	}
@@ -564,6 +603,117 @@ static int pa_callback(void *pa_input, void *pa_output, unsigned long pa_frames_
 #endif
 	return ret;
 }
+
+#if ANDROID_DSD
+/*
+ Native DSD output for Android players whose firmware has a DSD AudioTrack encoding (FiiO).
+ A writer thread stands in for the portaudio callback: it pulls DSD_U16_LE frames with
+ _output_frames(), packs them to the byte layout the DAC expects and writes them to the
+ AudioTrack (android.c), which blocks and so paces the thread. A format, rate or state change
+ ends the thread and asks for a reopen, as pa_stream_finished does for portaudio.
+ */
+extern bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes);
+extern bool dsd_track_write(const u8_t *buf, unsigned len);
+extern unsigned dsd_track_position(void);
+extern void dsd_track_close(void);
+
+#define DSD_CHUNK_FRAMES 4096 // squeezelite frames per write
+
+static thread_type dsd_thread;
+static volatile bool dsd_running = false;
+
+// DSD_U16_LE frames hold rev(b0) << 24 | rev(b1) << 16 per channel, b0 the earliest byte.
+// The DAC takes a 16-bit L/R interleave, each 16-bit pair little-endian, at every DSD rate
+// (verified by ear on an M11 Plus at DSD64/128/256; a 32-bit interleave plays with hiss).
+static void dsd_pack(const u32_t *in, u8_t *out, frames_t frames) {
+	frames_t i;
+	for (i = 0; i < frames; i++) {
+		u32_t l = in[2 * i], r = in[2 * i + 1];
+		*out++ = l >> 16; *out++ = l >> 24;
+		*out++ = r >> 16; *out++ = r >> 24;
+	}
+}
+
+static void *dsd_writer(void *arg) {
+	unsigned rate = pa.rate;                   // squeezelite frame rate: DSD bit rate / 16
+	u8_t *frames_buf = malloc(DSD_CHUNK_FRAMES * BYTES_PER_FRAME);
+	u8_t *packed = malloc(DSD_CHUNK_FRAMES * 4);
+	u64_t written = 0;                         // squeezelite frames handed to the track
+	bool reopen = false;
+
+	if (!frames_buf || !packed ||
+		!dsd_track_open(rate / 2, rate / 2 * 8 / 4, DSD_CHUNK_FRAMES * 4)) { // track rate = DSD / 32; 0.25s buffer
+		LOG_ERROR("native DSD output failed to open at %u", rate);
+		free(frames_buf);
+		free(packed);
+		return NULL;
+	}
+
+	while (dsd_running) {
+		frames_t wanted = DSD_CHUNK_FRAMES, got;
+		u64_t played = (u64_t)dsd_track_position() * 2;
+
+		LOCK;
+		output.device_frames = written > played ? (unsigned)(written - played) : 0;
+		output.updated = gettime_ms();
+		output.frames_played_dmp = output.frames_played;
+		optr = frames_buf;
+		do {
+			got = _output_frames(wanted);
+			wanted -= got;
+			if (pa.fmt != output.outfmt || pa.rate != output.current_sample_rate) break;
+		} while (wanted > 0 && got != 0);
+		if (wanted > 0) {
+			memset(optr, 0x69, wanted * BYTES_PER_FRAME); // DSD silence
+		}
+		if (output.state == OUTPUT_OFF || pa.fmt != output.outfmt || pa.rate != output.current_sample_rate) {
+			reopen = true;
+		}
+		UNLOCK;
+
+		dsd_pack((u32_t *)frames_buf, packed, DSD_CHUNK_FRAMES);
+		if (!dsd_track_write(packed, DSD_CHUNK_FRAMES * 4)) {
+			reopen = true;
+		}
+		written += DSD_CHUNK_FRAMES;
+		if (reopen) break;
+	}
+
+	dsd_track_close();
+	free(frames_buf);
+	free(packed);
+
+	LOCK;
+	if (reopen && dsd_running) {
+		// ended itself: hand the output back as portaudio does when its stream finishes
+		LOG_INFO("DSD output finished");
+		output.pa_reopen = true;
+		wake_controller();
+	}
+	dsd_running = false;
+	UNLOCK;
+	return NULL;
+}
+
+// called with the output lock held
+static void dsd_writer_start(void) {
+	pa.rate = output.current_sample_rate;
+	pa.fmt = output.outfmt;
+	pa.dsd = true;
+	dsd_running = true;
+	LOG_INFO("native DSD output at %u (DSD%u)", pa.rate, pa.rate * 16 / 44100);
+	pthread_create(&dsd_thread, NULL, dsd_writer, NULL);
+}
+
+// called with the output lock held; the writer needs the lock to finish
+static void dsd_writer_stop(void) {
+	dsd_running = false;
+	UNLOCK;
+	pthread_join(dsd_thread, NULL);
+	LOCK;
+	pa.dsd = false;
+}
+#endif
 
 void output_init_pa(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay,
                     unsigned idle, bool use_fixed_volume) {
@@ -638,6 +788,12 @@ void output_close_pa(void) {
 
 	running = false;
 	monitor_thread_running = false;
+
+#if ANDROID_DSD
+	if (pa.dsd) {
+		dsd_writer_stop();
+	}
+#endif
 
 	if (pa.stream) {
 		if ((err = Pa_AbortStream(pa.stream)) != paNoError) {

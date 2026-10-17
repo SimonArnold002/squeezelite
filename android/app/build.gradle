@@ -32,6 +32,11 @@ android {
         }
     }
     buildTypes {
+        debug {
+            // DSD test build: installs beside the released app instead of over it
+            applicationIdSuffix ".dsdtest"
+            versionNameSuffix "-dsdtest"
+        }
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
