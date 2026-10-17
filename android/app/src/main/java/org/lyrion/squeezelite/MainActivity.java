@@ -117,6 +117,8 @@ public class MainActivity extends AppCompatActivity {
                     ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.POST_NOTIFICATIONS}, PERMISSION_POST_NOTIFICATIONS);
                 } else {
                     startPlayer();
+                    showNowPlaying();
+                    finish();
                 }
             }
         });
@@ -147,6 +149,8 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode == PERMISSION_POST_NOTIFICATIONS) {
             if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 startPlayer();
+                showNowPlaying();
+                finish();
             }
             return;
         }
@@ -158,8 +162,12 @@ public class MainActivity extends AppCompatActivity {
         startService(new Intent(MainActivity.this, PlayerService.class));
     }
 
+    // Reached from the now playing screen's gear, go back to that screen rather than stacking
+    // another one on top of this
     private void showNowPlaying() {
-        startActivity(new Intent(this, NowPlayingActivity.class));
+        Intent intent = new Intent(this, NowPlayingActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        startActivity(intent);
     }
 
     private void stopPlayer() {

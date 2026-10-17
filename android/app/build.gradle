@@ -35,11 +35,19 @@ android {
         debug {
             // DSD test build: installs beside the released app instead of over it
             applicationIdSuffix ".dsdtest"
-            versionNameSuffix "-dsdtest"
+            versionNameSuffix "-dsdtest-3"
         }
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    // DSD test build: name the APK after its version, so copies handed out can be told apart
+    applicationVariants.all { variant ->
+        if (variant.buildType.name == 'debug') {
+            variant.outputs.all {
+                outputFileName = "Squeezelite-${variant.versionName}.apk"
+            }
         }
     }
     namespace 'org.lyrion.squeezelite'
