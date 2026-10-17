@@ -82,9 +82,21 @@ public class MainActivity extends AppCompatActivity {
                ) {
                 Utils.debug("Start player from launcher/app...");
                 startPlayer();
+                if (!askedToStartPlayer) {
+                    showNowPlaying();
+                }
                 finish();
                 return;
             }
+        }
+
+        // From the launcher with the player running, show what it is playing; this screen is
+        // still reached from the now playing screen, which passes FROM_PLAYER_SERVICE_EXTRA
+        Intent launch = getIntent();
+        if ((null==launch || !launch.getBooleanExtra(FROM_PLAYER_SERVICE_EXTRA, false)) && Utils.isPlayerRunning(this)) {
+            showNowPlaying();
+            finish();
+            return;
         }
 
         setContentView(R.layout.activity_main);
@@ -144,6 +156,10 @@ public class MainActivity extends AppCompatActivity {
     private void startPlayer() {
         Utils.debug("Start player service");
         startService(new Intent(MainActivity.this, PlayerService.class));
+    }
+
+    private void showNowPlaying() {
+        startActivity(new Intent(this, NowPlayingActivity.class));
     }
 
     private void stopPlayer() {

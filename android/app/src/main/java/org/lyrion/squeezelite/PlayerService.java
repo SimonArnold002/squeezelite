@@ -199,8 +199,7 @@ public class PlayerService extends MediaBrowserServiceCompat {
             return null;
         }
         try {
-            Intent intent = new Intent(this, MainActivity.class);
-            intent.putExtra(MainActivity.FROM_PLAYER_SERVICE_EXTRA, true);
+            Intent intent = new Intent(this, NowPlayingActivity.class);
             PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, intent,
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? PendingIntent.FLAG_MUTABLE : PendingIntent.FLAG_UPDATE_CURRENT);
             SharedPreferences prefs = Prefs.get(this);

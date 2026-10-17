@@ -21,6 +21,7 @@
 package org.lyrion.squeezelite;
 
 import android.graphics.Bitmap;
+import android.media.AudioFormat;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -37,9 +38,14 @@ import org.json.JSONObject;
  * e.g. as AVRCP metadata for a BT car stereo, and to Android Auto, the lock screen, etc.
  */
 public class NowPlaying {
+    // Session metadata read by NowPlayingActivity: the file's format, e.g. "DSD128 • native"
+    public static final String FORMAT_KEY = "org.lyrion.squeezelite.FORMAT";
     private static final String SEPARATOR = " • ";
-    // artist, album, duration, coverid, artwork url, remote stream title, is-remote, year
-    private static final String TAGS = "tags:aldcKNxy";
+    // artist, album, duration, coverid, artwork url, remote stream title, is-remote, year,
+    // type, samplerate, samplesize
+    private static final String TAGS = "tags:aldcKNxyoTI";
+    // The native library sends DSD to the DAC when the firmware has FiiO's DSD encoding
+    private static final boolean NATIVE_DSD = hasDsdEncoding();
     // Let LMS settle on the new track, and coalesce a burst of events into a single query
     private static final long QUERY_DELAY = 250;
     // If LMS still reports the previous track then try again after this long
@@ -124,15 +130,15 @@ public class NowPlaying {
         boolean remote = 0!=track.optInt("remote", 0);
         String title = firstOf(track, "title");
         String artist = firstOf(track, "artist", "trackartist", "albumartist", "artist_name");
-        // For a remote stream 'album' is not set, but remote_title names the station
-        String album = remote ? firstOf(track, "remote_title") : firstOf(track, "album");
-        if (!remote) {
-            album = appendYear(album, track.optInt("year", 0));
-        }
+        // A radio stream has no 'album', but remote_title names the station; a streaming
+        // service track (Qobuz, TIDAL...) is remote too, yet does have its album
+        String station = remote ? firstOf(track, "remote_title") : "";
+        String album = firstOf(track, "album");
+        album = Utils.isEmpty(album) ? station : appendYear(album, track.optInt("year", 0));
         if (remote && (Utils.isEmpty(title) || title.equals(artist))) {
             // Not every station sends usable metadata - one was seen putting the same changing
             // number in both title and artist. The station name is all LMS always knows.
-            title = album;
+            title = Utils.isEmpty(station) ? album : station;
             artist = "";
         }
         // Per-track for local files, but the status itself is better for remote streams
@@ -157,6 +163,8 @@ public class NowPlaying {
                     .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
                     .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, artist)
                     .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, album)
+                    .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, url)
+                    .putString(FORMAT_KEY, format(track))
                     .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, (long)(duration*1000));
             description = Utils.isEmpty(artist) ? title : (title + SEPARATOR + artist);
             if (!url.equals(coverUrl)) {
@@ -225,6 +233,42 @@ public class NowPlaying {
         session.setMetadata(metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, cover)
                                     .putBitmap(MediaMetadataCompat.METADATA_KEY_ART, cover)
                                     .build());
+    }
+
+    private static boolean hasDsdEncoding() {
+        try {
+            AudioFormat.class.getField("ENCODING_DSD_32BIT");
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // e.g. "DSD128 • native", "FLAC • 24-bit • 96 kHz", or just the type for a remote stream
+    private static String format(JSONObject track) {
+        String type = track.optString("type", "");
+        int rate = track.optInt("samplerate", 0);
+        int bits = track.optInt("samplesize", 0);
+        if ("dsf".equals(type) || "dff".equals(type)) {
+            return (rate>=44100 ? "DSD" + (rate/44100) : "DSD") + SEPARATOR + (NATIVE_DSD ? "native" : "as PCM");
+        }
+        StringBuilder sb = new StringBuilder();
+        switch (type) {
+            case "flc": sb.append("FLAC"); break;
+            case "alc": sb.append("ALAC"); break;
+            case "aif": sb.append("AIFF"); break;
+            case "ops": sb.append("Opus"); break;
+            case "ogg": sb.append("Ogg Vorbis"); break;
+            default: sb.append(type.toUpperCase());
+        }
+        if (bits>1) {
+            sb.append(SEPARATOR).append(bits).append("-bit");
+        }
+        if (rate>0) {
+            sb.append(SEPARATOR).append(rate%1000==0 ? String.valueOf(rate/1000) : String.valueOf(rate/1000.0)).append(" kHz");
+        }
+        String text = sb.toString();
+        return text.startsWith(SEPARATOR) ? text.substring(SEPARATOR.length()) : text;
     }
 
     private static String appendYear(String album, int year) {
