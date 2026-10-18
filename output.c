@@ -157,6 +157,8 @@ frames_t _output_frames(frames_t avail) {
 				output.current_sample_rate = output.next_sample_rate;
 				IF_DSD(
 				   output.outfmt = output.next_fmt;
+				   output.current_raw_rate = output.next_raw_rate;
+				   output.current_codec = output.next_codec;
 				)
 				if (output.fade == FADE_INACTIVE || output.fade_mode != FADE_CROSSFADE) {
 					output.current_replay_gain = output.next_replay_gain;
@@ -450,9 +452,15 @@ void output_flush(void) {
 		output.stop_time = gettime_ms();
 		if (output.error_opening) {
 			output.current_sample_rate = output.default_sample_rate;
+			IF_DSD(
+			   output.current_raw_rate = 0;
+			)
 		}
 		output.delay_active = false;
 	}
+	IF_DSD(
+	   output.current_codec = 0; // the next track's is known only at its start: the app shows none until then
+	)
 	output.frames_played = 0;
 	UNLOCK;
 }

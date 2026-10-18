@@ -30,6 +30,7 @@ import android.media.AudioManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
@@ -94,6 +95,7 @@ public class Library {
     private volatile PlayerService service;
     private VolumeChangeObserver observer;
     private OutputRouteCallback outputRouteCallback;
+    private HandlerThread routeThread;
     private AudioManager audioManager;
     private volatile JsonRpc jsonRpc;
     private String ipAddress;
@@ -119,6 +121,8 @@ public class Library {
     // come for that connection; apps may not read the kernel's list). So the rates it reported for
     // the same DAC before are used (knownRates), and for a DAC it never reported them for, the
     // rates every USB DAC takes.
+    // Runs on its own thread (routeThread): outputRoute waits for the output lock, which the
+    // library holds while it opens the output (1.3s measured on the FiiO).
     private class OutputRouteCallback extends AudioDeviceCallback {
         private final int[] FALLBACK_RATES = {44100, 48000};
 
@@ -158,20 +162,23 @@ public class Library {
             Utils.info("USB audio output attached:" + usb + (usb ? ", rates:" + Arrays.toString(rates) : ""));
             boolean changed = null!=usbAttached && usbAttached!=usb;
             usbAttached = usb;
-            outputRoute(!usb, usb ? rates : null);
-            if (changed) {
-                restartTrack(usb, rates);
+            // Without native DSD (not a FiiO) the route changes nothing in the library, so no restart
+            int route = outputRoute(!usb, usb ? rates : null);
+            if (changed && ROUTE_NOT_APPLIED!=route) {
+                restartTrack(ROUTE_PCM_STALE==route);
             }
         }
     }
 
-    private static boolean takesRate(int[] rates, int rate) {
-        for (int r : rates) {
-            if (r==rate) {
-                return true;
-            }
-        }
-        return false;
+    // outputRoute's answer: not applied (no native DSD), applied, or applied and the PCM stream now
+    // playing runs at a rate the new route would not give it
+    private static final int ROUTE_NOT_APPLIED = 0;
+    private static final int ROUTE_APPLIED = 1;
+    private static final int ROUTE_PCM_STALE = 2;
+
+    // LMS's type for a DSD file
+    static boolean isDsdType(String type) {
+        return "dsf".equals(type) || "dff".equals(type);
     }
 
     // A USB DAC's rates as Android reports them, kept per DAC (by product name) for the times it
@@ -216,24 +223,20 @@ public class Library {
     // a rate a USB DAC cannot take is silent, and PCM resampled for a USB DAC that has gone would
     // stay at that rate. So LMS streams it again from the same point, and the library decodes
     // that for the new route. Paused, LMS only moves the resume point, and the new stream starts
-    // on resume. A PCM stream that cannot seek (radio) is left.
-    private void restartTrack(boolean usb, int[] dacRates) {
-        getStatus("tags:oT", response -> {
+    // on resume. A PCM stream that cannot seek (radio) is left. Whether a PCM stream's rate is
+    // wrong for the new route comes from the library (pcmStale), which knows the stream's own rate
+    // and what it was resampled to; LMS's samplerate is the file's, not what LMS sends (maxBitrate).
+    private void restartTrack(boolean pcmStale) {
+        getStatus("tags:o", response -> {
             JSONObject result = null==response ? null : response.optJSONObject("result");
             if (null==result || "stop".equals(result.optString("mode", "stop"))) {
                 return;
             }
             JSONArray loop = result.optJSONArray("playlist_loop");
             JSONObject track = null!=loop && loop.length()>0 ? loop.optJSONObject(0) : null;
-            String type = null==track ? "" : track.optString("type", "");
-            boolean dsd = "dsf".equals(type) || "dff".equals(type);
+            boolean dsd = null!=track && isDsdType(track.optString("type", ""));
             if (!dsd) {
-                if (null==track) {
-                    return;
-                }
-                int rate = outputRate;
-                boolean wrongRate = usb ? !takesRate(dacRates, rate) : rate!=track.optInt("samplerate", rate);
-                if (outputDsd || !wrongRate || 1!=result.optInt("can_seek", 0)) {
+                if (null==track || !pcmStale || 1!=result.optInt("can_seek", 0)) {
                     return;
                 }
             }
@@ -318,8 +321,10 @@ public class Library {
             observer = new VolumeChangeObserver();
             service.getApplicationContext().getContentResolver().registerContentObserver(Settings.System.CONTENT_URI, true, observer);
         }
+        routeThread = new HandlerThread("OutputRoute");
+        routeThread.start();
         outputRouteCallback = new OutputRouteCallback();
-        audioManager.registerAudioDeviceCallback(outputRouteCallback, handler);
+        audioManager.registerAudioDeviceCallback(outputRouteCallback, new Handler(routeThread.getLooper()));
         int volumeToRestore = prefs.getBoolean(Prefs.RESTORE_VOLUME_KEY, Prefs.DEFAULT_RESTORE_VOLUME) ? (int)prefs.getLong(Prefs.VOLUME_KEY, -1) : -1;
         if (volumeToRestore>=0) {
             Utils.info("Restore volume:" + volumeToRestore);
@@ -367,6 +372,10 @@ public class Library {
         if (null != outputRouteCallback) {
             audioManager.unregisterAudioDeviceCallback(outputRouteCallback);
             outputRouteCallback = null;
+        }
+        if (null != routeThread) {
+            routeThread.quitSafely();
+            routeThread = null;
         }
         handler.removeCallbacks(applyLmsVolumeTask);
         pendingLmsVolume = UNKNOWN_VOL;
@@ -556,9 +565,17 @@ public class Library {
         return outputDsd;
     }
 
-    // 0 until the output first opens
+    // 0 until the output first opens, and while the DSD writer has no track (a silent hold, a
+    // route without native DSD, a failed DSD open or write). Otherwise the rate of the last output
+    // that opened: a failed PCM open or an idle-closed output keeps it
     public int getOutputRate() {
         return outputRate;
+    }
+
+    // The format LMS sends the track playing in, as the library's codec id ('f' flac, 'm' mp3,
+    // 'd' dsd, 'p' pcm, 'l' alac, 'a' aac, 'o' ogg, 'u' opus); 0 when not known
+    public char getStreamCodec() {
+        return loaded ? streamCodec() : 0;
     }
 
     public void prev() {
@@ -596,12 +613,14 @@ public class Library {
         }
     }
 
+    // Also called from the route thread, so jsonRpc is read once
     public void getStatus(String tags, Response.Listener<JSONObject> listener) {
-        if (null==jsonRpc) {
+        JsonRpc rpc = jsonRpc;
+        if (null==rpc) {
             listener.onResponse(null);
             return;
         }
-        jsonRpc.sendMessage(new String[]{"status", "-", "1", tags}, listener);
+        rpc.sendMessage(new String[]{"status", "-", "1", tags}, listener);
     }
 
     public void fetchImage(String url, int maxSize, Response.Listener<Bitmap> listener) {
@@ -620,5 +639,6 @@ public class Library {
 
     private native void start(String lms, String mac, String name, int idleTimeout, int fixedVolume, int logging, int mobileNetwork, int streamBuffer, int openSlEs);
     private native void stop();
-    private native void outputRoute(boolean dsdOk, int[] dacRates);
+    private native int outputRoute(boolean dsdOk, int[] dacRates);
+    private native char streamCodec();
 }

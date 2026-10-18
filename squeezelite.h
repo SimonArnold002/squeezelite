@@ -725,7 +725,11 @@ struct outputstate {
 	dsd_format outfmt;
 	dsd_format dsdfmt;	       // set in dsd_init - output for DSD: DOP, DSD_U8, ...
 	unsigned dsd_delay;		   // set in dsd_init - delay in ms switching to/from dop
-	unsigned dsd_max_rate;     // highest rate sent as DSD, when below supported_rates[0]; 0 = supported_rates[0]
+	unsigned dsd_max_rate;     // highest DSD frame rate sent as native DSD, in place of supported_rates[0] (may be above it); 0 = supported_rates[0]
+	unsigned next_raw_rate;    // set in decode thread - the stream's own rate, before any resampling
+	unsigned current_raw_rate; // next_raw_rate of the track playing; 0 = not known
+	char next_codec;           // set in decode thread - id of the codec decoding the stream LMS sends ('m' = mp3...)
+	char current_codec;        // next_codec of the track playing; 0 = not known
 #endif
 };
 

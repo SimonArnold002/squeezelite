@@ -375,6 +375,19 @@ void _pa_open(void) {
 	if (pa.dsd) {
 		dsd_writer_stop();
 	}
+
+	// After a stop the output comes on with the last track's format and rate still set, and the
+	// next track's first frame at the head of the buffer: open for that track. Otherwise a FLAC after
+	// a DSD track opens a native DSD track first, and the reverse opens PCM for a DSD track. The rate
+	// goes with it, as a DSD frame rate opened as PCM (705.6k after DSD256) hangs the FiiO's DAC. The
+	// track start then has nothing to change. A PCM rate change alone is left as upstream has it.
+	if (output.state != OUTPUT_OFF && output.track_start && output.track_start == outputbuf->readp &&
+		output.outfmt != output.next_fmt) {
+		LOG_INFO("output opens for the next track: %s at %u", output.next_fmt == DSD_U16_LE ? "native DSD" : "PCM",
+				 output.next_sample_rate);
+		output.outfmt = output.next_fmt;
+		output.current_sample_rate = output.next_sample_rate;
+	}
 #endif
 
 	if (output.state == OUTPUT_OFF) {
@@ -671,6 +684,14 @@ static void dsd_fall_back(void) {
 	}
 }
 
+static bool route_takes(const unsigned rates[], unsigned rate) {
+	unsigned i;
+	for (i = 0; i < MAX_SUPPORTED_SAMPLERATES && rates[i]; i++) {
+		if (rates[i] == rate) return true;
+	}
+	return false;
+}
+
 // android.c, from the Java audio device callback: whether the route takes native DSD, and the
 // PCM rates it takes. The FiiO's own DAC takes DSD; a USB DAC the FiiO routes to does not, and
 // its HAL hides that: the DSD track writes fine into a USB output that never opens (silence), and
@@ -681,8 +702,14 @@ static void dsd_fall_back(void) {
 // plays silent (the HAL retries the open). So while one is attached, dac_rates (highest first, 0
 // terminated) replace the player's own, and later tracks are resampled to one of them (decoders
 // read output.supported_rates at each track start). NULL restores the player's own.
-void output_route_pa(bool dsd_ok, const unsigned dac_rates[]) {
+// Returns whether the PCM track playing runs at a rate the new route would not give it, so that
+// Library has LMS stream it again: a rate the route cannot take (a USB DAC plugged in), or one it
+// was resampled to although the route takes its own rate (the DAC unplugged). A DSD track is
+// Library's to judge (it restarts every one), so native DSD output returns false.
+bool output_route_pa(bool dsd_ok, const unsigned dac_rates[]) {
 	const unsigned *rates = dac_rates ? dac_rates : own_rates;
+	unsigned raw;
+	bool pcm_stale;
 	LOCK;
 	if (dsd_route_ok != dsd_ok) {
 		LOG_INFO("output route %s native DSD", dsd_ok ? "takes" : "does not take");
@@ -699,7 +726,15 @@ void output_route_pa(bool dsd_ok, const unsigned dac_rates[]) {
 		}
 		LOG_INFO("output rates (%s):%s", dac_rates ? "USB DAC" : "player", list);
 	}
+	raw = output.current_raw_rate;
+	pcm_stale = output.outfmt == PCM && output.current_sample_rate &&
+				(!route_takes(rates, output.current_sample_rate) ||
+				 (raw && raw != output.current_sample_rate && route_takes(rates, raw)));
+	if (pcm_stale) {
+		LOG_INFO("PCM track at %u (own rate %u) is not at the rate the new route gives it", output.current_sample_rate, raw);
+	}
 	UNLOCK;
+	return pcm_stale;
 }
 
 static bool dsd_open_track(unsigned rate) {
@@ -711,6 +746,16 @@ static bool dsd_open_track(unsigned rate) {
 	LOCK;
 	dsd_fall_back();
 	UNLOCK;
+	return false;
+}
+
+// The writer's track, opened when asked: returns whether it has one. Without one nothing reaches
+// the DAC, so the app is told rate 0 rather than left on the last output's format
+static bool dsd_writer_track(bool open, unsigned rate) {
+	if (open && dsd_open_track(rate)) {
+		return true;
+	}
+	send_output_format_to_app(false, 0);
 	return false;
 }
 
@@ -742,11 +787,10 @@ static void *dsd_writer(void *arg) {
 
 	if (hold) {
 		LOG_INFO("holding the output silent until the next track");
-	} else if (route_ok) {
-		track = dsd_open_track(rate);
-	} else {
+	} else if (!route_ok) {
 		LOG_INFO("output route does not take native DSD: this track plays silent");
 	}
+	track = dsd_writer_track(!hold && route_ok, rate);
 
 	while (dsd_running) {
 		frames_t wanted = DSD_CHUNK_FRAMES, got;
@@ -781,24 +825,24 @@ static void *dsd_writer(void *arg) {
 			// open a fresh one where DSD plays. Frames already in the old track are lost
 			if (track) {
 				dsd_track_close();
-				track = false;
 			}
 			if (route_ok) {
 				LOG_INFO("output route takes native DSD again: reopening at %u", rate);
-				track = dsd_open_track(rate);
-				track_base = written;
 			} else {
 				LOG_INFO("output route does not take native DSD: rest of this track plays silent");
 			}
+			track = dsd_writer_track(route_ok, rate);
+			track_base = written;
 		}
 
 		if (track) {
 			dsd_pack(frames_buf, packed, DSD_CHUNK_FRAMES);
 			if (!dsd_track_write(packed, DSD_CHUNK_FRAMES * 4)) {
-				track = false;
 				LOCK;
 				dsd_fall_back();
 				UNLOCK;
+				dsd_track_close(); // a later route change opens a fresh one, never on top of this
+				track = dsd_writer_track(false, rate);
 			}
 		} else {
 			usleep((u64_t)DSD_CHUNK_FRAMES * 1000000 / rate); // the time the chunk would have played

@@ -255,6 +255,11 @@ unsigned decode_newstream(unsigned sample_rate, unsigned supported_rates[]) {
 	// called with O locked to get sample rate for potentially processed output stream
 	// release O mutex during process_newstream as it can take some time
 
+	IF_DSD(
+		output.next_raw_rate = sample_rate; // the output route check (output_pa.c) compares it
+		output.next_codec = codec ? codec->id : 0; // the app shows what LMS sends (android.c)
+	)
+
 	MAY_PROCESS(
 		if (decode.process) {
 			// a copy, as the output route can change the rates while O is released (output_pa.c)

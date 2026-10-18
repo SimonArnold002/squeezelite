@@ -85,11 +85,13 @@ static int dsd_encoding = 0;
 static const unsigned fiio_rates[] = { 384000, 352800, 192000, 176400, 96000, 88200, 48000, 44100,
 									   32000, 24000, 22050, 16000, 12000, 11025, 8000 };
 
-// The output route, from Library's audio device callback (Java main thread): whether it takes
-// native DSD, and the rates of the USB DAC it goes to (route_dac false: the player's own rates).
-// Kept here across player restarts and handed to output_pa.c only while the output is up:
-// route_mutex orders that against start() bringing the output up and down.
-extern void output_route_pa(bool dsd_ok, const unsigned dac_rates[]);
+// The output route, from Library's audio device callback (its "OutputRoute" thread, never the
+// main thread: output_route_pa waits for the output lock): whether it takes native DSD, and the
+// rates of the USB DAC it goes to (route_dac false: the player's own rates). Kept here across
+// player restarts and handed to output_pa.c only while the output module is up (route_live, from
+// output init to close, and only with native DSD): route_mutex orders that against start()
+// bringing the output up and down.
+extern bool output_route_pa(bool dsd_ok, const unsigned dac_rates[]);
 static pthread_mutex_t route_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool route_ok = true;
 static bool route_dac = false;
@@ -546,10 +548,25 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_stop(JNIEnv * env, jo
 	slimproto_stop();
 }
 
+// The id of the codec decoding the track playing, so of the format LMS sends it in ('f' flac,
+// 'm' mp3, 'd' dsd, 'p' pcm, 'l' alac, 'a' aac, 'o' ogg, 'u' opus); 0 before the first track.
+// Read without the lock: one byte, set at each track start
+JNIEXPORT jchar JNICALL Java_org_lyrion_squeezelite_Library_streamCodec(JNIEnv * env, jobject jobj) {
+#if DSD
+	return (jchar)(unsigned char)output.current_codec;
+#else
+	return 0;
+#endif
+}
+
 // dsd_ok is false while a USB audio device is attached: the FiiO routes to it, and it cannot play
 // the DSD track. dac_rates are that device's rates, NULL or empty when not known (the player's own
-// are kept); those above the player's own maximum are dropped.
-JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_outputRoute(JNIEnv * env, jobject jobj, jboolean dsd_ok, jintArray dac_rates) {
+// are kept); those above the player's own maximum are dropped. Returns Library's ROUTE_ values:
+// 0 not applied (the output module is down, or there is no native DSD, so not a FiiO: the route
+// changes nothing), 1 applied, 2 applied and the PCM track playing is at a rate the new route
+// would not give it (output_route_pa).
+JNIEXPORT jint JNICALL Java_org_lyrion_squeezelite_Library_outputRoute(JNIEnv * env, jobject jobj, jboolean dsd_ok, jintArray dac_rates) {
+	jint route = 0;
 #if DSD
 	unsigned rates[MAX_SUPPORTED_SAMPLERATES] = { 0 };
 	unsigned n = 0;
@@ -574,7 +591,8 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_outputRoute(JNIEnv * 
 	route_ok = dsd_ok;
 	route_dac = n > 0;
 	memcpy(route_rates, rates, sizeof(route_rates));
-	if (route_live) output_route_pa(route_ok, route_dac ? route_rates : NULL);
+	if (route_live) route = output_route_pa(route_ok, route_dac ? route_rates : NULL) ? 2 : 1;
 	pthread_mutex_unlock(&route_mutex);
 #endif
+	return route;
 }

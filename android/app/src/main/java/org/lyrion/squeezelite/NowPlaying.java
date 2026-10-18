@@ -240,22 +240,28 @@ public class NowPlaying {
                                     .build());
     }
 
-    // The file as LMS reports it, then what the library actually sends the DAC where that differs:
-    // e.g. "DSD128 • native", "DSD128 • as PCM 88.2 kHz" (a USB DAC), "FLAC • 24-bit • 192 kHz •
-    // as 96 kHz", or just the type for a remote stream
+    // The file as LMS reports it, then where that differs what LMS sends (its transcode: maxBitrate,
+    // the DSD Player plugin) and what the library sends the DAC: e.g. "DSD128 • native", "DSD128 •
+    // as PCM 88.2 kHz" (a USB DAC), "DSD128 • as FLAC 352.8 kHz" (LMS converted it), "FLAC • 24-bit
+    // • 192 kHz • as 96 kHz", "FLAC • 24-bit • 192 kHz • as MP3 48 kHz", or just the type for a
+    // remote stream
     private String format(JSONObject track) {
         String type = track.optString("type", "");
         int rate = track.optInt("samplerate", 0);
         int bits = track.optInt("samplesize", 0);
         int outRate = lib.getOutputRate();
-        if ("dsf".equals(type) || "dff".equals(type)) {
+        String sent = sentFormat(type, lib.getStreamCodec());
+        if (Library.isDsdType(type)) {
             // Native, or PCM: converted by the library (no native DSD, or not at this rate or
             // route), or by LMS before it reached the player
             String text = rate>=44100 ? "DSD" + (rate/44100) : "DSD";
             if (outRate<=0) {
-                return text;
+                return null==sent ? text : text + SEPARATOR + "as " + sent;
             }
-            return text + SEPARATOR + (lib.isOutputDsd() ? "native" : "as PCM " + kHz(outRate));
+            if (lib.isOutputDsd()) {
+                return text + SEPARATOR + "native";
+            }
+            return text + SEPARATOR + "as " + (null==sent ? "PCM" : sent) + " " + kHz(outRate);
         }
         StringBuilder sb = new StringBuilder();
         switch (type) {
@@ -271,12 +277,50 @@ public class NowPlaying {
         }
         if (rate>0) {
             sb.append(SEPARATOR).append(kHz(rate));
-            if (outRate>0 && outRate!=rate && !lib.isOutputDsd()) {
-                sb.append(SEPARATOR).append("as ").append(kHz(outRate));
+        }
+        boolean otherRate = rate>0 && outRate>0 && outRate!=rate && !lib.isOutputDsd();
+        if (null!=sent || otherRate) {
+            sb.append(SEPARATOR).append("as ");
+            if (null!=sent) {
+                sb.append(sent);
+            }
+            if (otherRate) {
+                sb.append(null!=sent ? " " : "").append(kHz(outRate));
             }
         }
         String text = sb.toString();
         return text.startsWith(SEPARATOR) ? text.substring(SEPARATOR.length()) : text;
+    }
+
+    // The format LMS sends the track in, by the library's codec id, when it is not the file's own:
+    // null when it is, or when either is not known (a type not listed here, no track yet)
+    private static String sentFormat(String type, char codec) {
+        char own;
+        switch (type) {
+            case "flc": own = 'f'; break;
+            case "mp3": own = 'm'; break;
+            case "dsf": case "dff": own = 'd'; break;
+            case "wav": case "aif": own = 'p'; break;
+            case "alc": own = 'l'; break;
+            case "aac": case "mp4": own = 'a'; break;
+            case "ogg": own = 'o'; break;
+            case "ops": own = 'u'; break;
+            default: return null;
+        }
+        if (0==codec || codec==own) {
+            return null;
+        }
+        switch (codec) {
+            case 'f': return "FLAC";
+            case 'm': return "MP3";
+            case 'd': return "DSD";
+            case 'p': return "PCM";
+            case 'l': return "ALAC";
+            case 'a': return "AAC";
+            case 'o': return "Ogg Vorbis";
+            case 'u': return "Opus";
+            default: return null;
+        }
     }
 
     private static String kHz(int rate) {
