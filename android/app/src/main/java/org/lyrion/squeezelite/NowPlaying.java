@@ -175,7 +175,7 @@ public class NowPlaying {
             publishMetadata();
             service.trackChanged();
         } else if (null!=metadata && !fmt.equals(formatText)) {
-            // Native DSD fell back to PCM since the track began
+            // The output opened, or reopened, after the track began
             formatText = fmt;
             metadata.putString(FORMAT_KEY, fmt);
             publishMetadata();
@@ -240,15 +240,22 @@ public class NowPlaying {
                                     .build());
     }
 
-    // e.g. "DSD128 • native", "FLAC • 24-bit • 96 kHz", or just the type for a remote stream
+    // The file as LMS reports it, then what the library actually sends the DAC where that differs:
+    // e.g. "DSD128 • native", "DSD128 • as PCM 88.2 kHz" (a USB DAC), "FLAC • 24-bit • 192 kHz •
+    // as 96 kHz", or just the type for a remote stream
     private String format(JSONObject track) {
         String type = track.optString("type", "");
         int rate = track.optInt("samplerate", 0);
         int bits = track.optInt("samplesize", 0);
+        int outRate = lib.getOutputRate();
         if ("dsf".equals(type) || "dff".equals(type)) {
-            // The library decides per track, from the rate, whether the DAC gets DSD or PCM
-            boolean nativeDsd = rate>0 && rate<=lib.nativeDsdMaxRate();
-            return (rate>=44100 ? "DSD" + (rate/44100) : "DSD") + SEPARATOR + (nativeDsd ? "native" : "as PCM");
+            // Native, or PCM: converted by the library (no native DSD, or not at this rate or
+            // route), or by LMS before it reached the player
+            String text = rate>=44100 ? "DSD" + (rate/44100) : "DSD";
+            if (outRate<=0) {
+                return text;
+            }
+            return text + SEPARATOR + (lib.isOutputDsd() ? "native" : "as PCM " + kHz(outRate));
         }
         StringBuilder sb = new StringBuilder();
         switch (type) {
@@ -263,10 +270,17 @@ public class NowPlaying {
             sb.append(SEPARATOR).append(bits).append("-bit");
         }
         if (rate>0) {
-            sb.append(SEPARATOR).append(rate%1000==0 ? String.valueOf(rate/1000) : String.valueOf(rate/1000.0)).append(" kHz");
+            sb.append(SEPARATOR).append(kHz(rate));
+            if (outRate>0 && outRate!=rate && !lib.isOutputDsd()) {
+                sb.append(SEPARATOR).append("as ").append(kHz(outRate));
+            }
         }
         String text = sb.toString();
         return text.startsWith(SEPARATOR) ? text.substring(SEPARATOR.length()) : text;
+    }
+
+    private static String kHz(int rate) {
+        return (rate%1000==0 ? String.valueOf(rate/1000) : String.valueOf(rate/1000.0)) + " kHz";
     }
 
     private static String appendYear(String album, int year) {

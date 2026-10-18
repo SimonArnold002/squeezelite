@@ -56,6 +56,7 @@ public class Prefs {
     public static final String USE_BT_ID_KEY = "use_bt_id";
     public static final String SEND_TRACK_DETAILS_KEY = "send_track_details";
     public static final String AUDIO_FOCUS_KEY = "audio_focus";
+    public static final String USB_DAC_RATES_KEY_PREFIX = "usb_dac_rates:"; // + the DAC's product name
     public static int MAX_BITRATE_ALWAYS = 0;
     public static int MAX_BITRATE_WHEN_CELLULAR = 1;
     public static int MAX_BITRATE_WHEN_METERED = 2;

@@ -257,8 +257,11 @@ unsigned decode_newstream(unsigned sample_rate, unsigned supported_rates[]) {
 
 	MAY_PROCESS(
 		if (decode.process) {
+			// a copy, as the output route can change the rates while O is released (output_pa.c)
+			unsigned rates[MAX_SUPPORTED_SAMPLERATES];
+			memcpy(rates, supported_rates, sizeof(rates));
 			UNLOCK_O;
-			sample_rate = process_newstream(&decode.direct, sample_rate, supported_rates);
+			sample_rate = process_newstream(&decode.direct, sample_rate, rates);
 			LOCK_O;
 		}
 	);

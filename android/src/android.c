@@ -28,6 +28,7 @@
 
 extern struct outputstate output;
 extern struct buffer *outputbuf;
+extern bool user_rates;
 
 static JavaVM *jvm = NULL;
 static jclass clazz = 0;
@@ -76,6 +77,32 @@ static void set_dsd_loglevel(log_level level) {
  packed by output_pa.c. Only the DSD writer thread in output_pa.c calls the dsd_track functions.
  */
 static int dsd_encoding = 0;
+
+// FiiO firmware gives apps PCM up to 384k (705.6k and 768k play only in its USB DAC mode: an
+// app's stream is set to the rate but runs at ~61k, silent) and native DSD up to DSD256. So
+// the player offers rates up to 384k: LMS downsamples higher-rate files, and DSD converted to
+// PCM above that (DSD512) is resampled here, only when needed.
+static const unsigned fiio_rates[] = { 384000, 352800, 192000, 176400, 96000, 88200, 48000, 44100,
+									   32000, 24000, 22050, 16000, 12000, 11025, 8000 };
+
+// The output route, from Library's audio device callback (Java main thread): whether it takes
+// native DSD, and the rates of the USB DAC it goes to (route_dac false: the player's own rates).
+// Kept here across player restarts and handed to output_pa.c only while the output is up:
+// route_mutex orders that against start() bringing the output up and down.
+extern void output_route_pa(bool dsd_ok, const unsigned dac_rates[]);
+static pthread_mutex_t route_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool route_ok = true;
+static bool route_dac = false;
+static unsigned route_rates[MAX_SUPPORTED_SAMPLERATES];
+static bool route_live = false;
+
+static void dsd_route_live(bool live) {
+	pthread_mutex_lock(&route_mutex);
+	route_live = live && dsd_encoding;
+	if (route_live) output_route_pa(route_ok, route_dac ? route_rates : NULL);
+	pthread_mutex_unlock(&route_mutex);
+}
+
 static JNIEnv *dsd_env = NULL;
 static jobject dsd_track = NULL;
 static jbyteArray dsd_array = NULL;
@@ -335,6 +362,31 @@ void send_playback_state_to_app(void) {
 	}
 }
 
+// What the output now sends the DAC: native DSD at the DSD bit rate, or PCM at the stream rate
+void send_output_format_to_app(bool dsd, unsigned rate) {
+	if (!jvm || !obj || !clazz) {
+		return;
+	}
+	JNIEnv *env;
+	bool detached = JNI_EDETACHED == (*jvm)->GetEnv(jvm, &env, JNI_VERSION_1_6);
+	if (detached) {
+		if (JNI_OK!=(*jvm)->AttachCurrentThread(jvm, &env, NULL)) {
+			LOG_ERROR("Failed to get attach current thread");
+			return;
+		}
+	}
+	jmethodID method = (*env)->GetMethodID(env, clazz, "outputFormatChanged", "(ZI)V");
+	if (method) {
+		(*env)->CallVoidMethod(env, obj, method, (jboolean)(dsd ? JNI_TRUE : JNI_FALSE), (jint)rate);
+	} else {
+		(*env)->ExceptionClear(env);
+		LOG_ERROR("outputFormatChanged not found");
+	}
+	if (detached) {
+		(*jvm)->DetachCurrentThread(jvm);
+	}
+}
+
 void send_connection_state_to_app(const char *address) {
 	if (!jvm || !obj || !clazz) {
 		return;
@@ -373,6 +425,7 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 	unsigned rates[MAX_SUPPORTED_SAMPLERATES] = { 0 };
 	unsigned rate_delay = 0;
 	char *resample = NULL;
+	unsigned max_rate = 0;
 	char *output_params = NULL;
 #if DSD
 	unsigned dsd_delay = 0;
@@ -409,8 +462,14 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 	set_dsd_loglevel(loglevel);
 	dsd_encoding = find_dsd_encoding(env);
 	if (dsd_encoding) {
+		// fiio_rates, resampling only a rate the route does not take (to one it does)
+		static char fiio_resample[] = "hE"; // process_init splits it in place
 		dsd_outfmt = DSD_U16_LE;
 		LOG_INFO("native DSD available (encoding %d)", dsd_encoding);
+		memcpy(rates, fiio_rates, sizeof(fiio_rates));
+		user_rates = true;
+		resample = fiio_resample;
+		max_rate = fiio_rates[0]; // what LMS is told, whatever DAC the route goes to when it connects
 	}
 #endif
 	signal(SIGINT, sighandler);
@@ -448,6 +507,12 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 
 #if DSD
 	dsd_init(dsd_outfmt, dsd_delay);
+	if (dsd_encoding) {
+		mutex_lock(outputbuf->mutex);
+		output.dsd_max_rate = 705600; // DSD256: DSD_U16_LE frames run at the DSD rate / 16
+		mutex_unlock(outputbuf->mutex);
+	}
+	dsd_route_live(true);
 #endif
 
 	decode_init(log_decode, include_codecs, exclude_codecs);
@@ -458,11 +523,14 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 	}
 #endif
 
-	slimproto(log_slimproto, !server || strlen(server)==0 ? NULL : server, mac, name, namefile, modelname, 0, mobile_network);
+	slimproto(log_slimproto, !server || strlen(server)==0 ? NULL : server, mac, name, namefile, modelname, max_rate, mobile_network);
 
 	decode_close();
 	stream_close();
 
+#if DSD
+	dsd_route_live(false);
+#endif
 	output_close_pa();
 
 #if USE_SSL && !LINKALL && !NO_SSLSYM
@@ -478,13 +546,35 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_stop(JNIEnv * env, jo
 	slimproto_stop();
 }
 
-// For the format line: the highest DSD bit rate sent to the DAC as DSD, 0 when DSD plays as
-// PCM (no FiiO encoding, or native output failed and fell back). Mirrors dsd.c, which converts
-// to PCM when the DSD_U16_LE frame rate (DSD rate / 16) is above supported_rates[0].
-JNIEXPORT jint JNICALL Java_org_lyrion_squeezelite_Library_nativeDsdMaxRate(JNIEnv * env, jobject jobj) {
+// dsd_ok is false while a USB audio device is attached: the FiiO routes to it, and it cannot play
+// the DSD track. dac_rates are that device's rates, NULL or empty when not known (the player's own
+// are kept); those above the player's own maximum are dropped.
+JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_outputRoute(JNIEnv * env, jobject jobj, jboolean dsd_ok, jintArray dac_rates) {
 #if DSD
-	return output.dsdfmt == DSD_U16_LE ? (jint)(output.supported_rates[0] * 16) : 0;
-#else
-	return 0;
+	unsigned rates[MAX_SUPPORTED_SAMPLERATES] = { 0 };
+	unsigned n = 0;
+	jsize len = dac_rates ? (*env)->GetArrayLength(env, dac_rates) : 0;
+	if (len > 0) {
+		jint *r = (*env)->GetIntArrayElements(env, dac_rates, NULL);
+		jsize i;
+		unsigned j;
+		// insert each, highest first, no repeats
+		for (i = 0; r && i < len && n < MAX_SUPPORTED_SAMPLERATES - 1; i++) {
+			unsigned rate = r[i] > 0 ? (unsigned)r[i] : 0;
+			if (!rate || rate > fiio_rates[0]) continue;
+			for (j = 0; j < n && rates[j] > rate; j++);
+			if (j < n && rates[j] == rate) continue;
+			memmove(rates + j + 1, rates + j, (n - j) * sizeof(rates[0]));
+			rates[j] = rate;
+			n++;
+		}
+		if (r) (*env)->ReleaseIntArrayElements(env, dac_rates, r, JNI_ABORT);
+	}
+	pthread_mutex_lock(&route_mutex);
+	route_ok = dsd_ok;
+	route_dac = n > 0;
+	memcpy(route_rates, rates, sizeof(route_rates));
+	if (route_live) output_route_pa(route_ok, route_dac ? route_rates : NULL);
+	pthread_mutex_unlock(&route_mutex);
 #endif
 }

@@ -80,6 +80,8 @@ libsoxr = CmakeProject(
         '-DBUILD_SHARED_LIBS=OFF',        
         '-DWANT_STATIC=ON',
         '-DBUILD_TESTS=OFF',
+        '-DWITH_OPENMP=OFF',
+        '-DWITH_LSR_BINDINGS=OFF',
     ],
     name='soxr',
     version='0.1.3'

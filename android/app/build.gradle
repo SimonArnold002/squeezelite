@@ -35,7 +35,7 @@ android {
         debug {
             // DSD test build: installs beside the released app instead of over it
             applicationIdSuffix ".dsdtest"
-            versionNameSuffix "-dsdtest-6"
+            versionNameSuffix "-dsdtest-17"
         }
         release {
             minifyEnabled true

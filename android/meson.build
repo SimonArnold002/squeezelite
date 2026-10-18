@@ -36,7 +36,7 @@ test_global_common_flags = [
 test_common_flags = [
   '-ffast-math',
   '-ftree-vectorize',
-  '-DPORTAUDIO', '-DNO_MAD', '-DDSD', '-DANDROID', '-DLINKALL', '-DNDEBUG', '-DPA_USE_OPENSLES', '-DPA_USE_AAUDIO', '-DPA_LITTLE_ENDIAN', '-I../src/pa', '-I../src/pa/common', '-I../src/pa/os/unix'
+  '-DPORTAUDIO', '-DNO_MAD', '-DDSD', '-DRESAMPLE', '-DANDROID', '-DLINKALL', '-DNDEBUG', '-DPA_USE_OPENSLES', '-DPA_USE_AAUDIO', '-DPA_LITTLE_ENDIAN', '-I../src/pa', '-I../src/pa/common', '-I../src/pa/os/unix'
 ]
 
 test_global_cxxflags = test_global_common_flags + [
@@ -113,6 +113,8 @@ sources = [
     '../dsd.c',
     '../dop.c',
     '../dsd2pcm/dsd2pcm.c',
+    '../process.c',
+    '../resample.c',
     'src/android.c',
     'src/thread.c',
     'src/pa/os/unix/pa_unix_hostapis.c',
@@ -170,6 +172,7 @@ link_args += [
   '-lvorbis',
   '-lvorbisenc',
   '-lvorbisfile',
+  '-lsoxr',
 ]
 #more_deps += [
 #  declare_dependency(sources: [bridge_header]),

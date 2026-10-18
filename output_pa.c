@@ -281,8 +281,14 @@ static void pa_stream_finished(void *userdata) {
 }
 
 #if ANDROID_DSD
-static void dsd_writer_start(void);
+static void dsd_writer_start(bool hold);
 static void dsd_writer_stop(void);
+
+// guarded by the output lock
+static bool dsd_refused = false;     // the DAC refused DSD: PCM until the player restarts
+static bool dsd_route_ok = true;     // the output route takes native DSD (output_route_pa)
+static unsigned dsd_route_gen = 0;   // bumped at each route change, followed by the writer
+static unsigned own_rates[MAX_SUPPORTED_SAMPLERATES]; // the player's rates, for the FiiO's own DAC
 #endif
 
 static thread_type monitor_thread;
@@ -379,7 +385,7 @@ void _pa_open(void) {
 #if ANDROID_DSD
 	} else if (output.outfmt == DSD_U16_LE) {
 		// native DSD goes to an AudioTrack, not portaudio
-		dsd_writer_start();
+		dsd_writer_start(false);
 		output.error_opening = false;
 		return;
 #endif
@@ -477,11 +483,30 @@ void _pa_open(void) {
 		if ((err = Pa_StartStream(pa.stream)) != paNoError) {
 			LOG_WARN("error starting stream: %s", Pa_GetErrorText(err));
 		}
+#if ANDROID_DSD
+		else {
+			send_output_format_to_app(false, pa.rate);
+		}
+#endif
 
 #ifndef PA18API
 		LOCK;
 #endif
 	}
+
+#if ANDROID_DSD
+	if (err == paInvalidSampleRate && output.state != OUTPUT_OFF) {
+		// AAudio refuses this rate outright (DSD converted to PCM above what the device takes, with no
+		// resampler to bring it down), so no reopen can succeed and the monitor thread would retry it
+		// without pause, starving the player. Hold the output instead: this track plays silent, the
+		// next opens. On a FiiO the resampler brings such rates down first, so this is a safety net.
+		LOG_WARN("rate %u cannot be opened: holding the output silent until the next track", output.current_sample_rate);
+		pa.stream = NULL;
+		dsd_writer_start(true);
+		output.error_opening = false;
+		return;
+	}
+#endif
 
 	if (err && !monitor_thread_running) {
 		vis_stop();
@@ -621,6 +646,7 @@ extern void dsd_track_close(void);
 
 static thread_type dsd_thread;
 static volatile bool dsd_running = false;
+static bool dsd_hold = false;       // the writer only holds the output, see _pa_open
 
 // DSD_U16_LE frames hold rev(b0) << 24 | rev(b1) << 16 per channel, b0 the earliest byte.
 // The DAC takes a 16-bit L/R interleave, each 16-bit pair little-endian, at every DSD rate
@@ -638,30 +664,94 @@ static void dsd_pack(const u32_t *in, u8_t *out, frames_t frames) {
 // output.dsdfmt at each track start), and the writer plays the rest of this one out as silence
 // so the timeline and LMS stay in step. Reopening DSD instead would fail the same way.
 static void dsd_fall_back(void) {
-	if (output.dsdfmt != PCM) {
+	if (!dsd_refused) {
 		LOG_ERROR("native DSD output failed: DSD plays as PCM until the player restarts");
+		dsd_refused = true;
 		output.dsdfmt = PCM;
 	}
+}
+
+// android.c, from the Java audio device callback: whether the route takes native DSD, and the
+// PCM rates it takes. The FiiO's own DAC takes DSD; a USB DAC the FiiO routes to does not, and
+// its HAL hides that: the DSD track writes fine into a USB output that never opens (silence), and
+// at the unplug is moved back to the FiiO's DAC as PCM (static). While the route cannot take DSD,
+// later tracks decode to PCM (dsd.c reads output.dsdfmt at each track start) and the writer drops
+// its track; when it can again, the writer opens a fresh one.
+// The FiiO also hands a PCM stream's rate to a USB DAC as it is, and a rate the DAC cannot take
+// plays silent (the HAL retries the open). So while one is attached, dac_rates (highest first, 0
+// terminated) replace the player's own, and later tracks are resampled to one of them (decoders
+// read output.supported_rates at each track start). NULL restores the player's own.
+void output_route_pa(bool dsd_ok, const unsigned dac_rates[]) {
+	const unsigned *rates = dac_rates ? dac_rates : own_rates;
+	LOCK;
+	if (dsd_route_ok != dsd_ok) {
+		LOG_INFO("output route %s native DSD", dsd_ok ? "takes" : "does not take");
+		dsd_route_ok = dsd_ok;
+		dsd_route_gen++;
+	}
+	output.dsdfmt = dsd_ok && !dsd_refused ? DSD_U16_LE : PCM;
+	if (memcmp(output.supported_rates, rates, sizeof(output.supported_rates))) {
+		char list[MAX_SUPPORTED_SAMPLERATES * 8] = "";
+		unsigned i;
+		memcpy(output.supported_rates, rates, sizeof(output.supported_rates));
+		for (i = 0; i < MAX_SUPPORTED_SAMPLERATES && rates[i]; i++) {
+			sprintf(list + strlen(list), " %u", rates[i]);
+		}
+		LOG_INFO("output rates (%s):%s", dac_rates ? "USB DAC" : "player", list);
+	}
+	UNLOCK;
+}
+
+static bool dsd_open_track(unsigned rate) {
+	if (dsd_track_open(rate / 2, rate / 2 * 8 / 4, DSD_CHUNK_FRAMES * 4)) { // track rate = DSD / 32; 0.25s buffer
+		send_output_format_to_app(true, rate * 16);
+		return true;
+	}
+	LOG_ERROR("native DSD output failed to open at %u", rate);
+	LOCK;
+	dsd_fall_back();
+	UNLOCK;
+	return false;
+}
+
+// called with the output lock held: the output needs reopening for what is now in the buffer.
+// A hold ends at the next track as well, whatever its format.
+static bool dsd_writer_done(bool hold, u32_t start_time) {
+	return pa.fmt != output.outfmt || pa.rate != output.current_sample_rate ||
+		   (hold && output.track_start_time != start_time);
 }
 
 static void *dsd_writer(void *arg) {
 	static u32_t frames_buf[DSD_CHUNK_FRAMES * 2]; // one writer at a time: dsd_writer_stop joins it
 	static u8_t packed[DSD_CHUNK_FRAMES * 4];
-	unsigned rate = pa.rate;                   // squeezelite frame rate: DSD bit rate / 16
+	unsigned rate = pa.rate;                   // squeezelite frame rate: DSD bit rate / 16, or the PCM rate on hold
+	bool hold = dsd_hold;                      // consume the frames silently, never open a track
 	u64_t written = 0;                         // squeezelite frames handed to the track
+	u64_t track_base = 0;                      // written when the current track opened
 	bool reopen = false;
-	bool track = dsd_track_open(rate / 2, rate / 2 * 8 / 4, DSD_CHUNK_FRAMES * 4); // track rate = DSD / 32; 0.25s buffer
+	bool track = false;
+	unsigned route_gen;
+	bool route_ok;
+	u32_t start_time;
 
-	if (!track) {
-		LOG_ERROR("native DSD output failed to open at %u", rate);
-		LOCK;
-		dsd_fall_back();
-		UNLOCK;
+	LOCK;
+	route_gen = dsd_route_gen;
+	route_ok = dsd_route_ok;
+	start_time = output.track_start_time;
+	UNLOCK;
+
+	if (hold) {
+		LOG_INFO("holding the output silent until the next track");
+	} else if (route_ok) {
+		track = dsd_open_track(rate);
+	} else {
+		LOG_INFO("output route does not take native DSD: this track plays silent");
 	}
 
 	while (dsd_running) {
 		frames_t wanted = DSD_CHUNK_FRAMES, got;
-		u64_t played = track ? (u64_t)dsd_track_position() * 2 : written;
+		u64_t played = track ? track_base + (u64_t)dsd_track_position() * 2 : written;
+		bool moved = false;
 
 		LOCK;
 		output.device_frames = written > played ? (unsigned)(written - played) : 0;
@@ -671,15 +761,36 @@ static void *dsd_writer(void *arg) {
 		do {
 			got = _output_frames(wanted);
 			wanted -= got;
-			if (pa.fmt != output.outfmt || pa.rate != output.current_sample_rate) break;
+			if (dsd_writer_done(hold, start_time)) break;
 		} while (wanted > 0 && got != 0);
 		if (wanted > 0) {
 			memset(optr, 0x69, wanted * BYTES_PER_FRAME); // DSD silence
 		}
-		if (output.state == OUTPUT_OFF || pa.fmt != output.outfmt || pa.rate != output.current_sample_rate) {
+		if (output.state == OUTPUT_OFF || dsd_writer_done(hold, start_time)) {
 			reopen = true;
 		}
+		if (!hold && dsd_route_gen != route_gen) {
+			route_gen = dsd_route_gen;
+			route_ok = dsd_route_ok;
+			moved = true;
+		}
 		UNLOCK;
+
+		if (moved) {
+			// the HAL moved the track with the route and cannot be trusted with it: drop it, and
+			// open a fresh one where DSD plays. Frames already in the old track are lost
+			if (track) {
+				dsd_track_close();
+				track = false;
+			}
+			if (route_ok) {
+				LOG_INFO("output route takes native DSD again: reopening at %u", rate);
+				track = dsd_open_track(rate);
+				track_base = written;
+			} else {
+				LOG_INFO("output route does not take native DSD: rest of this track plays silent");
+			}
+		}
 
 		if (track) {
 			dsd_pack(frames_buf, packed, DSD_CHUNK_FRAMES);
@@ -701,7 +812,7 @@ static void *dsd_writer(void *arg) {
 	LOCK;
 	if (reopen && dsd_running) {
 		// ended itself: hand the output back as portaudio does when its stream finishes
-		LOG_INFO("DSD output finished");
+		LOG_INFO("%s finished", hold ? "output hold" : "DSD output");
 		output.pa_reopen = true;
 		wake_controller();
 	}
@@ -710,13 +821,18 @@ static void *dsd_writer(void *arg) {
 	return NULL;
 }
 
-// called with the output lock held
-static void dsd_writer_start(void) {
+// called with the output lock held. hold: no output at all, the writer only paces the buffer
+static void dsd_writer_start(bool hold) {
 	pa.rate = output.current_sample_rate;
 	pa.fmt = output.outfmt;
 	pa.dsd = true;
+	dsd_hold = hold;
 	dsd_running = true;
-	LOG_INFO("native DSD output at %u (DSD%u)", pa.rate, pa.rate * 16 / 44100);
+	if (hold) {
+		LOG_INFO("output hold at %u", pa.rate);
+	} else {
+		LOG_INFO("native DSD output at %u (DSD%u)", pa.rate, pa.rate * 16 / 44100);
+	}
 	pthread_create(&dsd_thread, NULL, dsd_writer, NULL);
 }
 
@@ -760,6 +876,9 @@ void output_init_pa(log_level level, const char *device, unsigned output_buf_siz
 	LOG_INFO("init output");
 
 	memset(&output, 0, sizeof(output));
+#if ANDROID_DSD
+	dsd_refused = false;
+#endif
 
 #ifndef PA18API
 	output.latency = latency;
@@ -786,6 +905,9 @@ void output_init_pa(log_level level, const char *device, unsigned output_buf_siz
 	}
 
 	output_init_common(level, device, output_buf_size, rates, idle);
+#if ANDROID_DSD
+	memcpy(own_rates, output.supported_rates, sizeof(own_rates));
+#endif
 
 	LOCK;
 

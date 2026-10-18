@@ -439,6 +439,17 @@ public class PlayerService extends MediaBrowserServiceCompat {
         });
     }
 
+    // Read the status again rather than just redraw the format: the output opens for a new track
+    // before LMS reports it, and the new output must not be shown against the old track
+    public void outputFormatChanged() {
+        handler.post(() -> {
+            NowPlaying np = nowPlaying;
+            if (null!=np) {
+                np.update();
+            }
+        });
+    }
+
     public void trackChanged() {
         updateNotification();
     }

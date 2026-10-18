@@ -479,6 +479,7 @@ extern void send_output_state_to_app(u8_t spdif, u8_t dac);
 extern void send_volume_to_app(u32_t left, u32_t right);
 extern void send_connection_state_to_app(const char *address);
 extern void send_playback_state_to_app(void);
+extern void send_output_format_to_app(bool dsd, unsigned rate);
 extern char * get_ip_str(const struct sockaddr *sa);
 #else
 const char *logtime(void);
@@ -724,6 +725,7 @@ struct outputstate {
 	dsd_format outfmt;
 	dsd_format dsdfmt;	       // set in dsd_init - output for DSD: DOP, DSD_U8, ...
 	unsigned dsd_delay;		   // set in dsd_init - delay in ms switching to/from dop
+	unsigned dsd_max_rate;     // highest rate sent as DSD, when below supported_rates[0]; 0 = supported_rates[0]
 #endif
 };
 

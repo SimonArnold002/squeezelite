@@ -24,6 +24,8 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.database.ContentObserver;
 import android.graphics.Bitmap;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
@@ -36,7 +38,12 @@ import androidx.annotation.Keep;
 
 import com.android.volley.Response;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
+
+import java.util.Arrays;
+import java.util.Set;
+import java.util.TreeSet;
 
 
 public class Library {
@@ -76,6 +83,9 @@ public class Library {
     private long lmsVolumeSendTime;
     private int volumeControl = VOL_SEP;
     private volatile boolean playing = false;
+    // What the library last opened its output with: native DSD (at the DSD bit rate) or PCM
+    private volatile boolean outputDsd = false;
+    private volatile int outputRate = 0;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable applyLmsVolumeTask = this::applyLmsVolume;
     private int pendingLmsVolume = UNKNOWN_VOL;
@@ -83,6 +93,7 @@ public class Library {
     private boolean forgetOnStop = false;
     private volatile PlayerService service;
     private VolumeChangeObserver observer;
+    private OutputRouteCallback outputRouteCallback;
     private AudioManager audioManager;
     private volatile JsonRpc jsonRpc;
     private String ipAddress;
@@ -96,6 +107,140 @@ public class Library {
         public void onChange(boolean selfChange) {
             volumeChanged();
         }
+    }
+
+    // Native DSD only reaches the FiiO's own DAC. An attached USB DAC takes the route, and the
+    // DSD track cannot play there (silence, then static once it is unplugged), so the library
+    // plays DSD as PCM while one is attached. The FiiO also hands a PCM stream's rate to the USB
+    // DAC as it is (a rate the DAC cannot take is silent), so the library resamples to the DAC's
+    // own rates while it is attached. Registering reports the devices already attached.
+    // Android reports a USB DAC without its rates when it attaches while the player's PCM output
+    // is open (the FiiO HAL refuses the probe of the busy deep-buffer output, and the rates never
+    // come for that connection; apps may not read the kernel's list). So the rates it reported for
+    // the same DAC before are used (knownRates), and for a DAC it never reported them for, the
+    // rates every USB DAC takes.
+    private class OutputRouteCallback extends AudioDeviceCallback {
+        private final int[] FALLBACK_RATES = {44100, 48000};
+
+        private Boolean usbAttached = null;
+
+        @Override
+        public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+            update();
+        }
+
+        @Override
+        public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
+            update();
+        }
+
+        private void update() {
+            boolean usb = false;
+            Set<Integer> found = new TreeSet<>();
+            for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int type = device.getType();
+                if (type==AudioDeviceInfo.TYPE_USB_DEVICE || type==AudioDeviceInfo.TYPE_USB_HEADSET || type==AudioDeviceInfo.TYPE_USB_ACCESSORY) {
+                    usb = true;
+                    for (int rate : knownRates(device)) {
+                        found.add(rate);
+                    }
+                }
+            }
+            int[] rates = new int[found.size()];
+            int i = 0;
+            for (int rate : found) {
+                rates[i++] = rate;
+            }
+            if (usb && 0==rates.length) {
+                Utils.info("USB audio output rates not reported: using " + Arrays.toString(FALLBACK_RATES));
+                rates = FALLBACK_RATES;
+            }
+            Utils.info("USB audio output attached:" + usb + (usb ? ", rates:" + Arrays.toString(rates) : ""));
+            boolean changed = null!=usbAttached && usbAttached!=usb;
+            usbAttached = usb;
+            outputRoute(!usb, usb ? rates : null);
+            if (changed) {
+                restartTrack(usb, rates);
+            }
+        }
+    }
+
+    private static boolean takesRate(int[] rates, int rate) {
+        for (int r : rates) {
+            if (r==rate) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // A USB DAC's rates as Android reports them, kept per DAC (by product name) for the times it
+    // reports the DAC without them; empty if it never has
+    private int[] knownRates(AudioDeviceInfo device) {
+        int[] rates = device.getSampleRates();
+        PlayerService svc = service;
+        if (null==svc) {
+            return rates;
+        }
+        SharedPreferences prefs = Prefs.get(svc);
+        String key = Prefs.USB_DAC_RATES_KEY_PREFIX + device.getProductName();
+        if (rates.length>0) {
+            StringBuilder saved = new StringBuilder();
+            for (int rate : rates) {
+                saved.append(0==saved.length() ? "" : ",").append(rate);
+            }
+            if (!saved.toString().equals(prefs.getString(key, null))) {
+                prefs.edit().putString(key, saved.toString()).apply();
+            }
+            return rates;
+        }
+        String saved = prefs.getString(key, "");
+        if (saved.isEmpty()) {
+            return rates;
+        }
+        String[] parts = saved.split(",");
+        rates = new int[parts.length];
+        try {
+            for (int i = 0; i < parts.length; i++) {
+                rates[i] = Integer.parseInt(parts[i]);
+            }
+        } catch (NumberFormatException e) {
+            return new int[0];
+        }
+        Utils.info("USB audio output " + device.getProductName() + " reported without rates: using those it had before " + Arrays.toString(rates));
+        return rates;
+    }
+
+    // A track already decoded for the old route may not play right on the new one: native DSD
+    // into a USB DAC is silent, DSD128 or more as PCM (705.6k+) hangs the FiiO's own DAC, PCM at
+    // a rate a USB DAC cannot take is silent, and PCM resampled for a USB DAC that has gone would
+    // stay at that rate. So LMS streams it again from the same point, and the library decodes
+    // that for the new route. Paused, LMS only moves the resume point, and the new stream starts
+    // on resume. A PCM stream that cannot seek (radio) is left.
+    private void restartTrack(boolean usb, int[] dacRates) {
+        getStatus("tags:oT", response -> {
+            JSONObject result = null==response ? null : response.optJSONObject("result");
+            if (null==result || "stop".equals(result.optString("mode", "stop"))) {
+                return;
+            }
+            JSONArray loop = result.optJSONArray("playlist_loop");
+            JSONObject track = null!=loop && loop.length()>0 ? loop.optJSONObject(0) : null;
+            String type = null==track ? "" : track.optString("type", "");
+            boolean dsd = "dsf".equals(type) || "dff".equals(type);
+            if (!dsd) {
+                if (null==track) {
+                    return;
+                }
+                int rate = outputRate;
+                boolean wrongRate = usb ? !takesRate(dacRates, rate) : rate!=track.optInt("samplerate", rate);
+                if (outputDsd || !wrongRate || 1!=result.optInt("can_seek", 0)) {
+                    return;
+                }
+            }
+            double time = result.optDouble("time", 0);
+            Utils.info("Output route changed: restart the " + (dsd ? "DSD" : "PCM") + " track at " + time);
+            sendCommand(new String[]{"time", String.valueOf(time)});
+        });
     }
 
     public Library() {
@@ -173,6 +318,8 @@ public class Library {
             observer = new VolumeChangeObserver();
             service.getApplicationContext().getContentResolver().registerContentObserver(Settings.System.CONTENT_URI, true, observer);
         }
+        outputRouteCallback = new OutputRouteCallback();
+        audioManager.registerAudioDeviceCallback(outputRouteCallback, handler);
         int volumeToRestore = prefs.getBoolean(Prefs.RESTORE_VOLUME_KEY, Prefs.DEFAULT_RESTORE_VOLUME) ? (int)prefs.getLong(Prefs.VOLUME_KEY, -1) : -1;
         if (volumeToRestore>=0) {
             Utils.info("Restore volume:" + volumeToRestore);
@@ -216,6 +363,10 @@ public class Library {
         if (null != observer) {
             context.getApplicationContext().getContentResolver().unregisterContentObserver(observer);
             observer = null;
+        }
+        if (null != outputRouteCallback) {
+            audioManager.unregisterAudioDeviceCallback(outputRouteCallback);
+            outputRouteCallback = null;
         }
         handler.removeCallbacks(applyLmsVolumeTask);
         pendingLmsVolume = UNKNOWN_VOL;
@@ -389,6 +540,27 @@ public class Library {
         }
     }
 
+    // Called from the output thread whenever the output opens, so must not block
+    @Keep
+    public void outputFormatChanged(boolean dsd, int rate) {
+        Utils.debug("dsd:"+dsd+", rate:"+rate);
+        outputDsd = dsd;
+        outputRate = rate;
+        PlayerService svc = service;
+        if (null!=svc) {
+            svc.outputFormatChanged();
+        }
+    }
+
+    public boolean isOutputDsd() {
+        return outputDsd;
+    }
+
+    // 0 until the output first opens
+    public int getOutputRate() {
+        return outputRate;
+    }
+
     public void prev() {
         sendCommand(PREV_COMMAND);
     }
@@ -448,6 +620,5 @@ public class Library {
 
     private native void start(String lms, String mac, String name, int idleTimeout, int fixedVolume, int logging, int mobileNetwork, int streamBuffer, int openSlEs);
     private native void stop();
-    // The highest DSD rate the library sends to the DAC as DSD, 0 when DSD plays as PCM
-    public native int nativeDsdMaxRate();
+    private native void outputRoute(boolean dsdOk, int[] dacRates);
 }

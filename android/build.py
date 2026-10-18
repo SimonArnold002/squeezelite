@@ -45,6 +45,7 @@ thirdparty_libs = [
     libfaad,
     libopus,
     libmpg123,
+    libsoxr,
     ffmpeg
 ]
 

@@ -808,7 +808,7 @@ static decode_state dsd_decode(void) {
 			break;
 		}
 
-		if (outfmt != PCM && output.next_sample_rate > output.supported_rates[0]) {
+		if (outfmt != PCM && output.next_sample_rate > (output.dsd_max_rate ? output.dsd_max_rate : output.supported_rates[0])) {
 			LOG_INFO("DSD sample rate too high for device - converting to PCM");
 			outfmt = PCM;
 		}
