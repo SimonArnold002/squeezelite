@@ -166,6 +166,15 @@ public class SettingsActivity extends AppCompatActivity {
                 editor.apply();
             }
 
+            final Preference eversoloNowPlaying = getPreferenceManager().findPreference(Prefs.EVERSOLO_NOW_PLAYING_KEY);
+            if (eversoloNowPlaying != null) {
+                eversoloNowPlaying.setVisible(Utils.isEversolo());
+                // Whether the Eversolo closes the player when another source plays depends on the helper
+                if (Utils.isEversolo() && getContext() != null && Utils.isEversoloHelperInstalled(getContext())) {
+                    eversoloNowPlaying.setSummary(R.string.eversolo_now_playing_summary_helper);
+                }
+            }
+
             final Preference addressButton = getPreferenceManager().findPreference(Prefs.SERVER_KEY);
             if (addressButton != null) {
                 String current = new Discovery.Server(sharedPreferences.getString(Prefs.SERVER_KEY,"")).describe();

@@ -5,6 +5,8 @@
     <!-- Android Auto publishes whether it is projecting via this provider -->
     <queries>
         <provider android:authorities="androidx.car.app.connection" />
+        <!-- The Squeezelite Eversolo helper app (EversoloHelperLink) -->
+        <package android:name="org.lyrion.squeezelite.eversolo" />
     </queries>
 
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

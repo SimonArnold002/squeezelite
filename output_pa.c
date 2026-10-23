@@ -284,6 +284,10 @@ static void pa_stream_finished(void *userdata) {
 #if ANDROID_DSD
 static void dsd_writer_start(bool hold);
 static void dsd_writer_stop(void);
+static const char *fmt_name(dsd_format fmt);
+extern void es_log_audio_owner(const char *when); // TEST BUILD (Eversolo), android.c
+extern bool es_dac_taken(void);                     // android.c: the A8 gave its DAC to another source
+extern void es_output_lost(void);                   // android.c: output off, LMS paused (es_watch)
 
 // guarded by the output lock
 static bool dsd_refused = false;     // the DAC refused DSD: PCM until the player restarts
@@ -294,9 +298,12 @@ static bool pcm_track_refused = false; // the PCM AudioTrack failed: portaudio u
 static bool sas_refused = false;     // HiBy's track failed: the AudioTrack or portaudio until the player restarts
 static bool sas_dsd_refused = false; // HiBy's DSD track failed: DSD as PCM until the player restarts
 static bool pcm_sas = false;         // the PCM writer running uses HiBy's track, not a Java AudioTrack
+static bool es_refused = false;      // Eversolo's sink failed: DSD as PCM until the player restarts
+static bool es_native_refused = false; // it failed on native DSD: DoP until the player restarts
 
 bool pcm_track_on = false;           // set by android.c before output_init_pa: Android 8.1, see pcm_writer
 bool sas_on = false;                 // set by android.c before output_init_pa: HiBy's own route, see pcm_writer
+bool es_on = false;                  // set by android.c before output_init_pa: Eversolo's own sink, see pcm_writer
 #define PCM_TRACK_MIN_RATE 48000     // the HiBy R5 plays 48k and up on a direct output, and mixes below it
 #define PCM_TRACK_MAX_RATE 192000    // Android 8.1's Java AudioTrack refuses more
 #define PCM_TRACK_MS 250             // the PCM AudioTrack's buffer
@@ -312,6 +319,16 @@ static bool pcm_sas_takes(unsigned rate) {
 static bool pcm_writer_takes(unsigned rate) {
 	return pcm_sas_takes(rate) ||
 		   (pcm_track_on && !pcm_track_refused && rate >= PCM_TRACK_MIN_RATE && rate <= PCM_TRACK_MAX_RATE);
+}
+
+// called with the output lock held, by android.c from the A8's DSD output setting: the format later DSD
+// tracks go to Eversolo's sink in (dsd.c reads output.dsdfmt at each track start), native DSD or DoP.
+// After the sink failed on one it stays at the next one down until the player restarts
+dsd_format _es_dsd_format(bool native) {
+	if (!es_refused) {
+		output.dsdfmt = native && !es_native_refused ? DSD_U32_BE : DOP;
+	}
+	return output.dsdfmt;
 }
 #endif
 
@@ -404,16 +421,25 @@ void _pa_open(void) {
 	// next track's first frame at the head of the buffer: open for that track. Otherwise a FLAC after
 	// a DSD track opens a native DSD track first, and the reverse opens PCM for a DSD track. The rate
 	// goes with it, as a DSD frame rate opened as PCM (705.6k after DSD256) hangs the FiiO's DAC. The
-	// track start then has nothing to change. A PCM rate change alone is left as upstream has it.
+	// track start then has nothing to change. A rate change alone is left as upstream has it, except on
+	// an Eversolo, where every open switches the A8's DAC: the old rate's open lasted only until the
+	// track start (DSD64 for 0.84 s before a DSD256 track, eversolo-13), so it opens for the next track.
 	// Not while decode_newstream has O released: the next track's start is set, but next_* are still
 	// the last stream's, or those of a track LMS flushed. The output then opens as it was, and the
 	// track start reopens it.
 	if (output.state != OUTPUT_OFF && output.track_start && output.track_start == outputbuf->readp &&
-		!output.next_unset && output.outfmt != output.next_fmt) {
-		LOG_INFO("output opens for the next track: %s at %u", output.next_fmt == DSD_U16_LE ? "native DSD" : "PCM",
-				 output.next_sample_rate);
+		!output.next_unset && (output.outfmt != output.next_fmt ||
+							   (es_on && output.current_sample_rate != output.next_sample_rate))) {
+		LOG_INFO("output opens for the next track: %s at %u", fmt_name(output.next_fmt), output.next_sample_rate);
 		output.outfmt = output.next_fmt;
 		output.current_sample_rate = output.next_sample_rate;
+	}
+#endif
+
+#if ANDROID_DSD
+	// TEST BUILD (Eversolo): which source the A8 thinks has the audio, at each open (android.c)
+	if (es_on && output.state != OUTPUT_OFF) {
+		es_log_audio_owner("at output open");
 	}
 #endif
 
@@ -432,6 +458,12 @@ void _pa_open(void) {
 		// native DSD through HiBy's track (pcm_writer); after it failed, the rest of this track is held
 		// silent, and later ones are decoded to PCM
 		dsd_writer_start(!sas_on || sas_dsd_refused);
+		output.error_opening = false;
+		return;
+	} else if ((output.outfmt == DOP || output.outfmt == DSD_U32_BE) && es_on) {
+		// DSD as DoP or native DSD through Eversolo's sink (pcm_writer); after it failed, the rest of this
+		// track is held silent, and later ones go as DoP (after native DSD) or are decoded to PCM
+		dsd_writer_start(es_refused || (output.outfmt == DSD_U32_BE && es_native_refused));
 		output.error_opening = false;
 		return;
 #endif
@@ -532,6 +564,9 @@ void _pa_open(void) {
 #if ANDROID_DSD
 		else {
 			send_output_format_to_app(false, pa.rate);
+		}
+		if (es_on) {
+			es_log_audio_owner(err ? "after a failed stream start" : "after the stream started");
 		}
 #endif
 
@@ -727,7 +762,7 @@ static bool route_takes(const unsigned rates[], unsigned rate) {
 
 // the output formats this player uses, for the log
 static const char *fmt_name(dsd_format fmt) {
-	return fmt == PCM ? "PCM" : fmt == DSD_U16_LE ? "native DSD" : "DoP";
+	return fmt == PCM ? "PCM" : fmt == DSD_U16_LE || fmt == DSD_U32_LE || fmt == DSD_U32_BE ? "native DSD" : "DoP";
 }
 
 // called with the lock held. Whether a track decoded for the old route, as fmt at rate (from its own
@@ -956,12 +991,19 @@ static void *dsd_writer(void *arg) {
    primary one, whose writer was the one stuck when the R5's driver deadlocked under AAudio.
  A failed open or write hands the stream to the next of HiBy's track, the Java one and portaudio,
  until the player restarts.
+ On an Eversolo player (es_on) it also writes DSD to Eversolo's sink (android.c es_track_*), in the format
+ the A8's DSD output setting gives (_es_dsd_format): as DoP, squeezelite's DOP frames, 32-bit words with
+ the markers added in _write_frames, at the DSD rate / 16; or as native DSD, its DSD_U32_BE frames at the
+ DSD rate / 32, see es_dsd_pack.
  */
 extern bool pcm_track_open(unsigned rate, unsigned buffer_frames, unsigned chunk_frames);
 extern bool pcm_track_write(const float *buf, unsigned frames);
 extern int sas_track_open(unsigned rate, bool dsd);
 extern bool sas_track_write(const u8_t *buf, unsigned bytes);
 extern void sas_track_close(void);
+extern int es_track_open(unsigned rate, bool native);
+extern bool es_track_write(const u8_t *buf, unsigned bytes);
+extern void es_track_close(void);
 // Native DSD through HiBy's track: squeezelite's DSD_U32_LE frames hold, per channel,
 // b0 << 24 | b1 << 16 | b2 << 8 | b3 (b0 the earliest byte, each byte MSB first). HiBy's track runs at
 // the DSD rate / 32 and its HAL takes the bytes interleaved, earliest first, MSB first: L b0, R b0,
@@ -977,6 +1019,17 @@ static void sas_dsd_pack(const u32_t *in, u8_t *out, frames_t frames) {
 	}
 }
 
+// Native DSD through Eversolo's sink, as Eversolo's own squeezelite sends it: DSD_U32_BE (ledger §A3
+// EVERSOLO DSD FOLLOWS ITS SETTING). The frames hold b0 << 24 ... b3 per channel as above, and the sink
+// passes the bytes on untouched to the A8's XMOS DAC, which takes each 32-bit word with b0 first, as
+// squeezelite's U32_BE packing writes it (output_pack.c). In place
+static void es_dsd_pack(u32_t *buf, frames_t frames) {
+	frames_t i;
+	for (i = 0; i < frames * 2; i++) {
+		buf[i] = __builtin_bswap32(buf[i]);
+	}
+}
+
 #define SAS_AHEAD_S 10 // seconds HiBy's writes may run ahead of the clock (its buffers) before its track is judged dead
 
 static void *pcm_writer(void *arg) {
@@ -986,6 +1039,8 @@ static void *pcm_writer(void *arg) {
 	unsigned rate = pa.rate;
 	bool sas = pcm_sas;                        // HiBy's track, else a Java AudioTrack
 	bool dsd = pa.fmt == DSD_U32_LE;           // native DSD, through HiBy's track
+	bool es = pa.fmt == DOP || pa.fmt == DSD_U32_BE; // through Eversolo's sink
+	bool es_dsd = pa.fmt == DSD_U32_BE;        // native DSD through it, else DoP
 	u64_t written = 0;                         // frames handed to the track
 	u64_t played = 0;                          // frames it has played: the Java one's 32-bit playback head, unwrapped
 	u64_t latency = 0;                         // HiBy's latency in frames: its track has no playback head
@@ -1000,21 +1055,21 @@ static void *pcm_writer(void *arg) {
 		LOG_DEBUG("PCM writer priority not raised: %s", strerror(errno));
 	}
 
-	if (sas) {
-		int ms = sas_track_open(rate, dsd);
+	if (es || sas) {
+		int ms = es ? es_track_open(rate, es_dsd) : sas_track_open(rate, dsd);
 		ok = ms >= 0;
 		latency = ms > 0 ? (u64_t)ms * rate / 1000 : 0;
 	} else {
 		ok = pcm_track_open(rate, rate * PCM_TRACK_MS / 1000, DSD_CHUNK_FRAMES);
 	}
 	if (ok) {
-		send_output_format_to_app(dsd, dsd ? rate * 32 : rate);
+		send_output_format_to_app(dsd || es, dsd || es_dsd ? rate * 32 : es ? rate * 16 : rate);
 	}
 
 	while (ok && dsd_running) {
 		frames_t wanted = DSD_CHUNK_FRAMES, got;
 
-		if (sas) {
+		if (es || sas) {
 			played = written > latency ? written - latency : 0;
 		} else {
 			u32_t pos = dsd_track_position();
@@ -1032,8 +1087,12 @@ static void *pcm_writer(void *arg) {
 			wanted -= got;
 			if (dsd_writer_done(false, 0)) break;
 		} while (wanted > 0 && got != 0);
-		if (wanted > 0) {
-			memset(optr, dsd ? 0x69 : 0, wanted * BYTES_PER_FRAME); // DSD or PCM silence
+		if (wanted > 0 && es && !es_dsd) {
+			// DoP silence, markers following on from the frames before it, as _write_frames makes it
+			dsd_silence_frames((u32_t *)optr, wanted);
+			update_dop((u32_t *)optr, wanted, false);
+		} else if (wanted > 0) {
+			memset(optr, dsd || es_dsd ? 0x69 : 0, wanted * BYTES_PER_FRAME); // DSD or PCM silence
 		}
 		if (output.state == OUTPUT_OFF) {
 			reopen = true;
@@ -1042,7 +1101,13 @@ static void *pcm_writer(void *arg) {
 		}
 		UNLOCK;
 
-		if (sas) {
+		if (es) {
+			if (es_dsd) {
+				es_dsd_pack(frames_buf, DSD_CHUNK_FRAMES);
+			}
+			// a real AudioTrack write: it blocks until taken, so it paces the thread
+			ok = es_track_write((u8_t *)frames_buf, DSD_CHUNK_FRAMES * BYTES_PER_FRAME);
+		} else if (sas) {
 			if (dsd) {
 				sas_dsd_pack(frames_buf, packed, DSD_CHUNK_FRAMES);
 			}
@@ -1065,8 +1130,8 @@ static void *pcm_writer(void *arg) {
 
 	if (ok && drain) {
 		// closing the track drops what it holds: let the end of this one play out first
-		u64_t left, most = sas ? rate : (u64_t)rate * PCM_TRACK_MS / 1000;
-		if (sas) {
+		u64_t left, most = es || sas ? rate : (u64_t)rate * PCM_TRACK_MS / 1000;
+		if (es || sas) {
 			left = latency;
 		} else {
 			u32_t pos = dsd_track_position();
@@ -1076,14 +1141,34 @@ static void *pcm_writer(void *arg) {
 		if (left > most) left = most;
 		usleep(left * 1000000 / rate + 20000);
 	}
-	if (sas) {
+	if (es) {
+		es_track_close();
+	} else if (sas) {
 		sas_track_close();
 	} else {
 		dsd_track_close();
 	}
 
 	LOCK;
-	if (!ok && dsd && !sas_dsd_refused) {
+	if (!ok && es && es_dac_taken()) {
+		// the A8 gave its DAC to one of its own sources, which kills our track: not a failed route. The
+		// output goes off, so the reopen below waits for play instead of taking the DAC straight back
+		// (android.c es_watch also pauses LMS)
+		LOG_INFO("Eversolo sink: the DAC went to another source");
+		es_output_lost();
+	} else if (!ok && es_dsd && !es_native_refused) {
+		// later tracks go as DoP (dsd.c reads output.dsdfmt at each track start)
+		LOG_ERROR("Eversolo sink failed on native DSD: DSD plays as DoP until the player restarts");
+		es_native_refused = true;
+		_es_dsd_format(false);
+	} else if (!ok && es) {
+		// as dsd_fall_back: later tracks decode to PCM (dsd.c reads output.dsdfmt at each track start)
+		if (!es_refused) {
+			LOG_ERROR("Eversolo sink failed: DSD plays as PCM until the player restarts");
+			es_refused = true;
+			output.dsdfmt = PCM;
+		}
+	} else if (!ok && dsd && !sas_dsd_refused) {
 		// as dsd_fall_back: later tracks decode to PCM (dsd.c reads output.dsdfmt at each track start)
 		LOG_ERROR("HiBy DSD track failed: DSD plays as PCM until the player restarts");
 		sas_dsd_refused = true;
@@ -1108,7 +1193,8 @@ static void *pcm_writer(void *arg) {
 
 // called with the output lock held. hold: no output at all, the writer only paces the buffer
 static void dsd_writer_start(bool hold) {
-	bool pcm = !hold && (output.outfmt == PCM || output.outfmt == DSD_U32_LE); // pcm_writer
+	bool pcm = !hold && (output.outfmt == PCM || output.outfmt == DSD_U32_LE || output.outfmt == DOP ||
+						 output.outfmt == DSD_U32_BE); // pcm_writer
 	pa.rate = output.current_sample_rate;
 	pa.fmt = output.outfmt;
 	pa.dsd = true;
@@ -1119,6 +1205,10 @@ static void dsd_writer_start(bool hold) {
 		LOG_INFO("output hold at %u", pa.rate);
 	} else if (output.outfmt == DSD_U32_LE) {
 		LOG_INFO("native DSD output at %u (DSD%u) through HiBy's track", pa.rate, pa.rate * 32 / 44100);
+	} else if (output.outfmt == DSD_U32_BE) {
+		LOG_INFO("native DSD output at %u (DSD%u) through Eversolo's sink", pa.rate, pa.rate * 32 / 44100);
+	} else if (output.outfmt == DOP) {
+		LOG_INFO("DoP output at %u (DSD%u) through Eversolo's sink", pa.rate, pa.rate * 16 / 44100);
 	} else if (pcm) {
 		LOG_INFO("PCM output at %u through %s", pa.rate, pcm_sas ? "HiBy's track" : "an AudioTrack");
 	} else {
@@ -1172,6 +1262,11 @@ void output_init_pa(log_level level, const char *device, unsigned output_buf_siz
 	pcm_track_refused = false;
 	sas_refused = false;
 	sas_dsd_refused = false;
+	es_refused = false;
+	es_native_refused = false;
+	if (es_on) {
+		LOG_INFO("DSD plays through Eversolo's sink");
+	}
 	if (sas_on) {
 		LOG_INFO("PCM from %u to %u plays through HiBy's track", SAS_MIN_RATE, SAS_MAX_RATE);
 	} else if (pcm_track_on) {

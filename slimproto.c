@@ -56,6 +56,12 @@ extern struct codec *codecs[];
 extern struct irstate ir;
 #endif
 
+#if defined(ANDROID) && DSD
+// output_pa.c: on an Eversolo the output lets go of the DAC whenever it is not playing, as the A8 closes
+// any other app's player (android.c es_watch)
+extern bool es_on;
+#endif
+
 event_event wake_e;
 
 #define LOCK_S   mutex_lock(streambuf->mutex)
@@ -324,6 +330,13 @@ static void process_strm(u8_t *pkt, int len) {
 			} else if (output.state != OUTPUT_OFF) {
 				output.state = OUTPUT_STOPPED;
 				output.stop_time = gettime_ms();
+#if defined(ANDROID) && DSD
+				if (es_on) {
+					// at once: play opens a fresh output, as after an idle timeout
+					output.state = OUTPUT_OFF;
+					LOG_INFO("Eversolo: paused, output off (the DAC is free)");
+				}
+#endif
 			}
 			UNLOCK_O;
 			if (!interval) sendSTAT("STMp", 0);
@@ -450,6 +463,8 @@ static void process_aude(u8_t *pkt, int len) {
 	if (aude->enable_spdif && output.state == OUTPUT_OFF
 #ifndef ANDROID
 		&& !output.idle_to
+#elif DSD
+		&& !es_on // an Eversolo: power on leaves the DAC alone; a play opens the output
 #endif
 		) {
 		output.state = OUTPUT_STOPPED;

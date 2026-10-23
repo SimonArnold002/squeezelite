@@ -1,2 +1,4 @@
 include ':app'
+// The Squeezelite Eversolo helper app (its NowPlayingService)
+include ':eversolo-helper'
 rootProject.name='squeezelite'

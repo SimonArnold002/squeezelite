@@ -1,0 +1,35 @@
+apply plugin: 'com.android.application'
+
+// The Squeezelite Eversolo helper (NowPlayingService): its own package by design, as the Eversolo
+// force-stops the playing app by package name
+android {
+    namespace 'org.lyrion.squeezelite.eversolo'
+    compileSdk 35
+    buildToolsVersion = "35.0.0"
+    defaultConfig {
+        applicationId "org.lyrion.squeezelite.eversolo"
+        // Eversolo players run Android 11
+        minSdkVersion 26
+        targetSdkVersion 34
+        versionCode 2
+        versionName "1.1"
+    }
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    // Name the APK after what it is, as the player's test builds are
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "SqueezeliteEversoloHelper-${variant.versionName}.apk"
+        }
+    }
+    lint {
+        checkReleaseBuilds false
+    }
+}

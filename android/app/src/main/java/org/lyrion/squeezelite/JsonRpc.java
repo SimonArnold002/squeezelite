@@ -70,6 +70,10 @@ public class JsonRpc {
         return mac;
     }
 
+    public ServerDiscovery.Server getServer() {
+        return server;
+    }
+
     public String getBaseUrl() {
         return "http://" + server.ip + ":" + server.port + "/";
     }

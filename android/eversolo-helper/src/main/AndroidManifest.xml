@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The player apps: NowPlayingService checks their signature, OpenPlayerActivity opens them -->
+    <queries>
+        <package android:name="org.lyrion.squeezelite" />
+        <package android:name="org.lyrion.squeezelite.dsdtest" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name">
+
+        <!-- What the Eversolo's now playing screen opens from its source icon. INFO, not LAUNCHER:
+             getLaunchIntentForPackage finds it, and the app list gets no second Squeezelite -->
+        <activity
+            android:name=".OpenPlayerActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.INFO" />
+            </intent-filter>
+        </activity>
+
+        <!-- Bound by the player; the sender of each message is checked -->
+        <service
+            android:name=".NowPlayingService"
+            android:exported="true" />
+
+    </application>
+
+</manifest>

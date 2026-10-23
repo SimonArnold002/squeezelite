@@ -39,8 +39,15 @@ import androidx.annotation.Keep;
 
 import com.android.volley.Response;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Set;
 import java.util.TreeSet;
@@ -93,6 +100,8 @@ public class Library {
     private boolean forgetOnStop = false;
     private volatile PlayerService service;
     private VolumeChangeObserver observer;
+    // Synchronized volume on an Eversolo: its DAC's own level, which Android's media volume does not move
+    private volatile EversoloVolume eversoloVolume;
     private OutputRouteCallback outputRouteCallback;
     private HandlerThread routeThread;
     private AudioManager audioManager;
@@ -304,7 +313,10 @@ public class Library {
         }
         jsonRpc = new JsonRpc(service, server, mac);
         forgetOnStop = VOL_SYNC==volumeControl;
-        if (VOL_SYNC==volumeControl) {
+        if (VOL_SYNC==volumeControl && Utils.isEversolo()) {
+            eversoloVolume = new EversoloVolume(service, new EversoloLms(),
+                                                new EversoloVolume.Api(this::eversoloOurs, this::eversoloMuted));
+        } else if (VOL_SYNC==volumeControl) {
             androidVolume = UNKNOWN_VOL;
             observer = new VolumeChangeObserver();
             service.getApplicationContext().getContentResolver().registerContentObserver(Settings.System.CONTENT_URI, true, observer);
@@ -324,15 +336,29 @@ public class Library {
 
         final String macToUse = mac;
         final String nameToUse = name;
-        thread = new Thread(() -> start(ipAddress,
-              macToUse,
-              nameToUse,
-              STREAM_IDLE_TIMEOUT,
-              VOL_SEP==volumeControl ? 0 : 1,
-              LOG_lINFO, // DSD test build: was LOG_ERROR
-              cellular || metered ? 1 : 0,
-              streamBuffer,
-              prefs.getBoolean(Prefs.USE_OPENSLES_KEY, Prefs.DEFAULT_USE_OPENSLES) ? 1 : 0));
+        // On an Eversolo set to its own now playing screen, the name the player process plays under
+        // (android.c es_name_process): the helper app's package, whose session that screen then shows
+        // and which the Eversolo closes when another source plays (EversoloHelperLink, on the same
+        // test in PlayerService); without the helper, this app's own, and the Eversolo closes the
+        // player. Otherwise none: the process keeps its own name
+        final String eversoloName = Utils.useEversoloHelper(service) ? Utils.EVERSOLO_HELPER_PACKAGE
+                : Utils.useEversoloNowPlaying(service) ? service.getPackageName() : "";
+        if (Utils.isEversolo()) {
+            setLogFd(openEversoloLog(service));
+        }
+        thread = new Thread(() -> {
+            stopStalePlay(server, macToUse);
+            start(ipAddress,
+                  macToUse,
+                  nameToUse,
+                  STREAM_IDLE_TIMEOUT,
+                  VOL_SEP==volumeControl ? 0 : 1,
+                  LOG_lINFO, // DSD test build: was LOG_ERROR
+                  cellular || metered ? 1 : 0,
+                  streamBuffer,
+                  prefs.getBoolean(Prefs.USE_OPENSLES_KEY, Prefs.DEFAULT_USE_OPENSLES) ? 1 : 0,
+                  eversoloName);
+        });
         thread.start();
         return usingBtName ? name : null;
     }
@@ -356,6 +382,10 @@ public class Library {
         if (null != observer) {
             context.getApplicationContext().getContentResolver().unregisterContentObserver(observer);
             observer = null;
+        }
+        if (null != eversoloVolume) {
+            eversoloVolume.release();
+            eversoloVolume = null;
         }
         if (null != outputRouteCallback) {
             audioManager.unregisterAudioDeviceCallback(outputRouteCallback);
@@ -420,6 +450,13 @@ public class Library {
 
     @Keep
     public synchronized void volumeChanged(int left, int right) {
+        EversoloVolume ev = eversoloVolume;
+        if (null!=ev) {
+            // The gain LMS sends cannot tell some volumes apart (41/42, 44/45, 47/48), so the sync asks LMS
+            // for its setting
+            ev.lmsChanged();
+            return;
+        }
         // We send LMS our volume, and that will cause it to send an update - which can cause
         // volume 'wiggles'. Therefore, if we receive an update too soon after sending a change
         // then ignore it.
@@ -523,6 +560,67 @@ public class Library {
             }
         }
         isInitialPower = false;
+    }
+
+    // Called from C code on an Eversolo when the Eversolo gave its DAC to one of its own sources while
+    // this player was playing (android.c es_watch): pause it in LMS, which would otherwise show it
+    // playing into nothing. Pressing play takes the DAC back
+    @Keep
+    public void eversoloOutputLost() {
+        Utils.info("Eversolo DAC taken by another source: pause");
+        EversoloVolume ev = eversoloVolume;
+        if (null!=ev) {
+            ev.lost();
+        }
+        sendCommand(PAUSE_COMMAND);
+    }
+
+    // Called from C code on an Eversolo when it shows this player as its source (android.c es_watch): at
+    // the start of play and at every resume. Its volume is then LMS's (EversoloVolume)
+    @Keep
+    public void eversoloShowsUs() {
+        EversoloVolume ev = eversoloVolume;
+        if (null!=ev) {
+            ev.started();
+        }
+    }
+
+    // LMS's side of the Eversolo volume sync: this player's volume setting, each request waited for, on
+    // the sync's thread
+    private class EversoloLms implements EversoloVolume.Lms {
+        @Override
+        public EversoloVolume.Volume read() {
+            JsonRpc rpc = jsonRpc;
+            if (null==rpc) {
+                return null;
+            }
+            // the setting, not the fade LMS steps through on a pause or a mute; a muted player's is its
+            // level negated, and its mute setting changes at once (the volume at the fade's end)
+            JSONObject volume = lmsRequest(rpc.getServer(), rpc.getMac(), "mixer", "volume", "?");
+            JSONObject muting = null==volume ? null : lmsRequest(rpc.getServer(), rpc.getMac(), "mixer", "muting", "?");
+            if (null==muting) {
+                return null;
+            }
+            try {
+                return new EversoloVolume.Volume(Math.abs(Double.parseDouble(volume.getString("_volume"))),
+                                                 "1".equals(muting.optString("_muting")));
+            } catch (Exception e) {
+                Utils.warn("LMS volume not understood - " + e);
+                return null;
+            }
+        }
+
+        @Override
+        public boolean set(String volume) {
+            JsonRpc rpc = jsonRpc;
+            return null!=rpc && null!=lmsRequest(rpc.getServer(), rpc.getMac(), "mixer", "volume", volume);
+        }
+
+        @Override
+        public boolean mute() {
+            JsonRpc rpc = jsonRpc;
+            return null!=rpc && null!=lmsRequest(rpc.getServer(), rpc.getMac(), "mixer", "muting", "1");
+        }
     }
 
     // Called from C code when a track starts, or playback is paused, resumed, or stopped.
@@ -630,9 +728,106 @@ public class Library {
         return null==jsonRpc ? null : jsonRpc.getMac();
     }
 
-    private native void start(String lms, String mac, String name, int idleTimeout, int fixedVolume, int logging, int mobileNetwork, int streamBuffer, int openSlEs);
+    // TEST BUILD (Eversolo): the A8 has no adb, so the native player copies its process's log to
+    // Download/squeezelite-eversolo.txt, which the probe app serves. Android 11 refused the native
+    // player's own fopen there, so the file is made through MediaStore, which needs no permission,
+    // and its descriptor handed over. Returns -1 when it could not be made
+    private static int openEversoloLog(Context context) {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) {
+            return -1;
+        }
+        try {
+            android.content.ContentResolver cr = context.getContentResolver();
+            android.net.Uri downloads = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+            // the last run's copy: only this app's own rows are seen, so only it goes
+            cr.delete(downloads, android.provider.MediaStore.MediaColumns.DISPLAY_NAME + "=?",
+                    new String[]{EVERSOLO_LOG_NAME});
+            android.content.ContentValues values = new android.content.ContentValues();
+            values.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, EVERSOLO_LOG_NAME);
+            values.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+            values.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS);
+            android.net.Uri uri = cr.insert(downloads, values);
+            if (null == uri) {
+                Utils.error("Eversolo log: MediaStore refused the file");
+                return -1;
+            }
+            android.os.ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "w");
+            return null == pfd ? -1 : pfd.detachFd();
+        } catch (Exception e) {
+            Utils.error("Eversolo log: cannot make the file", e);
+            return -1;
+        }
+    }
+    private static final String EVERSOLO_LOG_NAME = "squeezelite-eversolo.txt";
+
+    // A player that went away mid-play (killed, its APK replaced, or force-stopped by an Eversolo)
+    // still plays as far as LMS knows. Back within LMS's 5 minutes, LMS restarts that play the moment
+    // it connects, whatever its power-on setting says (LMS 9.1 Squeezebox::reconnect, "restarting play
+    // on pseudo-reconnect"); after them the setting decides, from the "playing at power off" mark LMS
+    // made. So before connecting: stop that play and clear the mark, and the player comes up stopped.
+    // Not in a sync group, where LMS restarts nothing and a stop would stop the whole group. On the
+    // player's thread, as it waits for LMS: a few seconds at most
+    private static void stopStalePlay(ServerDiscovery.Server server, String mac) {
+        if (Utils.isEmpty(server.ip) || Utils.isEmpty(mac)) {
+            return;
+        }
+        JSONObject status = lmsRequest(server, mac, "status", "-", "1", "tags:");
+        if (null==status || !"play".equals(status.optString("mode")) || status.has("sync_master") || status.has("sync_slaves")) {
+            return;
+        }
+        Utils.info("LMS still has this player playing from before it went away: stop it, so it starts stopped");
+        lmsRequest(server, mac, "playerpref", "playingAtPowerOff", "0");
+        lmsRequest(server, mac, "stop");
+    }
+
+    // One LMS request for this player, waited for (JsonRpc's go through Volley, which answers later):
+    // the result, or null. LMS answers a player it does not know with nothing
+    private static JSONObject lmsRequest(ServerDiscovery.Server server, String mac, String... command) {
+        HttpURLConnection conn = null;
+        try {
+            JSONArray cmd = new JSONArray();
+            for (String c : command) {
+                cmd.put(c);
+            }
+            JSONObject request = new JSONObject()
+                    .put("id", 1)
+                    .put("method", "slim.request")
+                    .put("params", new JSONArray().put(mac.toLowerCase()).put(cmd));
+            conn = (HttpURLConnection) new URL("http://" + server.ip + ":" + server.port + "/jsonrpc.js").openConnection();
+            conn.setConnectTimeout(1500);
+            conn.setReadTimeout(1500);
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json");
+            try (OutputStream out = conn.getOutputStream()) {
+                out.write(request.toString().getBytes(StandardCharsets.UTF_8));
+            }
+            if (HttpURLConnection.HTTP_OK!=conn.getResponseCode()) {
+                return null;
+            }
+            StringBuilder body = new StringBuilder();
+            try (BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while (null!=(line = in.readLine())) {
+                    body.append(line);
+                }
+            }
+            return 0==body.length() ? null : new JSONObject(body.toString()).optJSONObject("result");
+        } catch (Exception e) {
+            Utils.warn("LMS request " + Arrays.toString(command) + " failed - " + e);
+            return null;
+        } finally {
+            if (null!=conn) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private native void setLogFd(int fd);
+    private native void start(String lms, String mac, String name, int idleTimeout, int fixedVolume, int logging, int mobileNetwork, int streamBuffer, int openSlEs, String eversoloName);
     private native void stop();
     private native boolean outputRoute(boolean dsdOk, int[] dacRates);
+    private native boolean eversoloOurs();
+    private native boolean eversoloMuted();
     private native char streamCodec();
     private native int streamRate();
 }

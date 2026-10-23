@@ -30,12 +30,18 @@
 #include <ucontext.h>
 #include <sys/prctl.h>
 #include <android/api-level.h>
+#include <sys/system_properties.h>
+#include <ctype.h>
 
 extern struct outputstate output;
 extern struct buffer *outputbuf;
 extern bool user_rates;
 extern bool pcm_track_on;
 extern bool sas_on;
+extern bool es_on;
+#if DSD
+extern dsd_format _es_dsd_format(bool native);
+#endif
 
 static JavaVM *jvm = NULL;
 static jclass clazz = 0;
@@ -517,6 +523,502 @@ void sas_track_close(void) {
 		LOG_INFO("HiBy track closed");
 	}
 }
+
+/*
+ Eversolo's own route to its built-in DAC (the DMP-A8, Android 11). Android's Java AudioFormat there has
+ no DSD encoding, but the firmware has libaudiosink.so, listed in /system/etc/public.libraries.txt so that
+ any app may load it, and Eversolo's own squeezelite (/system/bin/zeabcdclient) plays through it. It builds
+ Android's native AudioTrack on the DAC's DIRECT output. There is no header: the calls below are read from
+ its arm64 code (ledger §A3 EVERSOLO'S OWN ROUTE). It holds one sink for the whole process.
+ audio_sink_open(rate, format, channels) takes Android's PCM formats, DoP as 10/11/12 (32-bit, 8_24 and
+ packed 24-bit PCM on the DIRECT output) and AUDIO_FORMAT_DSD. DSD goes as the A8's own DSD output
+ setting says, as Eversolo's squeezelite sends it (ledger §A3 EVERSOLO DSD FOLLOWS ITS SETTING): on Native,
+ when the output takes it, native DSD (squeezelite's DSD_U32_BE frames, output_pa.c es_dsd_pack); on DoP,
+ DoP in 32-bit words, squeezelite's DOP frames as they are; on PCM no DSD at all (LMS converts it). Only
+ the PCM writer in output_pa.c uses the sink.
+ */
+#define ES_FORMAT_DOP_32 10      // DoP in 32-bit words: PCM_32_BIT with the DIRECT flags
+#define ES_FORMAT_DSD 0x1A000000 // AUDIO_FORMAT_DSD: native DSD, 32 bits a channel a frame
+// the A8's DSD output setting (persist.zidoo.dsd.output.mode: zidoo_ui's "PCM", "DOP", "Native")
+#define ES_DSD_PCM 0
+#define ES_DSD_DOP 1
+#define ES_DSD_NATIVE 2
+static int (*es_init_sink)(void);                            // audio_sink_init: gets a session id
+static int (*es_open)(int rate, int format, int channels);   // 0 = open
+static int (*es_write_loop)(const void *buf, int bytes);     // blocking; bytes written, < 0 = error
+static int (*es_latency)(void);                              // AudioTrack::latency(), ms
+static int (*es_close)(void);
+static int (*es_release)(void);                              // releases the session id
+static int (*es_dsd_mode_get)(void);                         // audio_sink_get_usb_dsd_mode: the DSD setting
+static int (*es_supports)(int format);                       // audio_sink_is_support_pcm_format: 1 = taken
+static bool es_open_now = false;
+static int es_dsd_mode_at_start = ES_DSD_DOP;
+
+static bool es_init(void) {
+	void *lib = dlopen("libaudiosink.so", RTLD_NOW);
+	if (!lib) return false;
+	es_init_sink = dlsym(lib, "audio_sink_init");
+	es_open = dlsym(lib, "audio_sink_open");
+	es_write_loop = dlsym(lib, "audio_sink_write_loop");
+	es_latency = dlsym(lib, "audio_sink_get_latency");
+	es_close = dlsym(lib, "audio_sink_close");
+	es_release = dlsym(lib, "audio_sink_release");
+	if (!es_init_sink || !es_open || !es_write_loop || !es_latency || !es_close || !es_release) {
+		dlclose(lib);
+		return false;
+	}
+	// without these DSD goes as DoP, the library's own default
+	es_dsd_mode_get = dlsym(lib, "audio_sink_get_usb_dsd_mode");
+	es_supports = dlsym(lib, "audio_sink_is_support_pcm_format");
+	return true;
+}
+
+// The A8's DSD output setting, as Eversolo's squeezelite reads it: the library's getDsdOutputMode, which
+// reads persist.zidoo.dsd.output.mode and gives DoP when it is unset or unknown
+static int es_dsd_mode(void) {
+	int mode = es_dsd_mode_get ? es_dsd_mode_get() : ES_DSD_DOP;
+	return mode == ES_DSD_PCM || mode == ES_DSD_NATIVE ? mode : ES_DSD_DOP;
+}
+
+// Whether the A8's output takes native DSD now (the library asks its policy service): Eversolo's
+// squeezelite checks this before it sends native DSD, and sends DoP otherwise
+static bool es_native_ok(void) {
+	return es_supports && es_supports(ES_FORMAT_DSD);
+}
+
+static const char *es_dsd_mode_name(int mode) {
+	return mode == ES_DSD_PCM ? "PCM" : mode == ES_DSD_NATIVE ? "Native" : "DoP";
+}
+
+// The A8's DAC, as the start-up probe found it (eversolo-7): its direct output takes 44.1k-768k (vendor
+// usb_audio_policy_configuration.xml) and Android mixes the lower rates to it. The probe is not run
+// there: each rate it tries opens a track on the DAC, which the A8 takes as our player taking its DAC,
+// at every player start, with nothing playing (ledger §A3 EVERSOLO HOLDS NO DAC)
+static const unsigned es_rates[] = { 768000, 705600, 384000, 352800, 192000, 176400, 96000, 88200, 48000, 44100,
+									 32000, 24000, 22050, 16000, 12000, 11025, 8000 };
+// A stopped output lets go of the A8's DAC after this, so a skip or a seek keeps it; a pause lets go at
+// once (slimproto.c). Elsewhere it is LMS's idle time, 30 s (Library.STREAM_IDLE_TIMEOUT)
+#define ES_IDLE_MS 1000
+
+// A playing sink, as Eversolo's squeezelite opens it (init, then open): native DSD at rate frames a
+// second (the DSD rate / 32), or DoP (the DSD rate / 16). Returns its latency in ms, or -1 when it failed
+int es_track_open(unsigned rate, bool native) {
+	int ret, latency;
+	es_init_sink();
+	ret = es_open((int)rate, native ? ES_FORMAT_DSD : ES_FORMAT_DOP_32, 2);
+	if (ret != 0) {
+		LOG_ERROR("Eversolo sink: audio_sink_open(%u, %s, 2) failed: %d", rate, native ? "native DSD" : "DoP 32-bit", ret);
+		es_release();
+		return -1;
+	}
+	es_open_now = true;
+	latency = es_latency();
+	LOG_INFO("Eversolo sink open: %s at %u (DSD%u), latency %d ms", native ? "native DSD" : "DoP", rate,
+			 rate * (native ? 32 : 16) / 44100, latency);
+	return latency < 0 ? 0 : latency;
+}
+
+// blocking write of the whole buffer; false when the sink took less
+bool es_track_write(const u8_t *buf, unsigned bytes) {
+	int ret = es_write_loop(buf, (int)bytes);
+	if (ret != (int)bytes) {
+		LOG_ERROR("Eversolo sink: audio_sink_write_loop wrote %d of %u bytes", ret, bytes);
+		return false;
+	}
+	return true;
+}
+
+void es_track_close(void) {
+	if (es_open_now) {
+		es_close();
+		es_release();
+		es_open_now = false;
+		LOG_INFO("Eversolo sink closed");
+	}
+}
+
+/*
+ The A8's now playing screen shows the media session of the package in zidoo.music.package.now, which its
+ audio libraries fill from the playing process's /proc/self/cmdline (ledger §A3 EVERSOLO VOLUME IS THE
+ DAC'S), and when another source takes the DAC the A8 force-stops the package of that name (§A3 EVERSOLO
+ KILLS, NEVER PAUSES). The player runs in its own process, "<package>:squeezelitePlayer", which matches no
+ session. So the player process takes the name the app gives it (Library.startPlayer): the Squeezelite
+ Eversolo helper app's package, whose session is a copy of ours (EversoloHelperLink), or without the
+ helper this app's own. As Android's Process.setArgV0 does: the name written over the argument block, the
+ rest zeroed. Only the process name changes; the app and its processes are as they were.
+ */
+static void es_name_process(const char *name) {
+	char cmdline[256] = "", stat[1024], *p;
+	unsigned long arg_start = 0, arg_end = 0;
+	FILE *f;
+	size_t n;
+	int field;
+
+	if (!(f = fopen("/proc/self/cmdline", "r"))) return;
+	n = fread(cmdline, 1, sizeof(cmdline) - 1, f);
+	fclose(f);
+	cmdline[n] = '\0';
+	if (!strcmp(cmdline, name)) return; // already so named
+
+	// arg_start and arg_end are fields 48 and 49; the name in field 2 may hold spaces, so count from its ')'
+	if (!(f = fopen("/proc/self/stat", "r"))) return;
+	n = fread(stat, 1, sizeof(stat) - 1, f);
+	fclose(f);
+	stat[n] = '\0';
+	if (!(p = strrchr(stat, ')'))) return;
+	for (field = 2; p && field < 48; field++) { // each step: p at the space before field + 1
+		p = strchr(p + 1, ' ');
+	}
+	if (!p || sscanf(p + 1, "%lu %lu", &arg_start, &arg_end) != 2 || arg_end <= arg_start ||
+		strlen(name) >= arg_end - arg_start || strncmp((char *)arg_start, cmdline, strlen(cmdline))) {
+		LOG_ERROR("Eversolo: process not renamed (argument block not found)");
+		return;
+	}
+	memset((char *)arg_start, 0, arg_end - arg_start);
+	strcpy((char *)arg_start, name);
+	LOG_INFO("Eversolo: player process named %s for the now playing screen", name);
+}
+
+/*
+ TEST BUILD (Eversolo): the A8 has no adb, so the player copies its own process's log (an app may read
+ its own) to Download/squeezelite-eversolo.txt, which the probe app serves. That includes libaudiosink's
+ own lines (tag AudioSink) and Android's audio client lines (AudioTrack, AAudio). Android 11 refused a
+ plain fopen there: the Java side makes the file through MediaStore and hands its descriptor over
+ (Library.setLogFd, before start). Restarted, truncated, at each player start.
+ */
+static int es_log_fd = -1;
+static void es_log_start(void);
+
+JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_setLogFd(JNIEnv *env, jobject jobj, jint fd) {
+	es_log_fd = fd;
+	es_log_start(); // now, so the app's lines from before the player starts are in the file too
+}
+
+// Who the A8 thinks has the audio, at an output open: its now playing source and the switch flag it
+// polls (ledger §A3 EVERSOLO VOLUME IS THE DAC'S, EVERSOLO'S OWN ROUTE)
+void es_log_audio_owner(const char *when) {
+	char now[PROP_VALUE_MAX] = "", last[PROP_VALUE_MAX] = "", changed[PROP_VALUE_MAX] = "";
+	__system_property_get("zidoo.music.package.now", now);
+	__system_property_get("zidoo.music.package.last", last);
+	__system_property_get("zidoo.music.value.changed", changed);
+	LOG_INFO("Eversolo audio owner %s: now '%s', last '%s', changed %s", when, now, last, changed);
+}
+
+// On Android 11 (API 30) liblog lets a process install its own logger, which then receives every
+// log line written in the process: ours, libaudiosink's, and Android's audio client's (AudioTrack,
+// AAudio). It writes each to the file and passes it on to logd as before. The A8 gave an empty file
+// with a logcat copy: an app's shell evidently may not run logcat there. Older Android: logcat copy.
+struct es_log_message {      // liblog's struct __android_log_message (API 30)
+	size_t struct_size;
+	int32_t buffer_id;
+	int32_t priority;
+	const char *tag;
+	const char *file;
+	uint32_t line;
+	const char *message;
+};
+typedef void (*es_logger_fn)(const struct es_log_message *message);
+static es_logger_fn es_logd_logger = NULL;
+static FILE *es_log_out = NULL;
+static pthread_mutex_t es_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void es_log_line(int priority, const char *tag, const char *message) {
+	struct timespec ts;
+	struct tm tm;
+	char when[24];
+	clock_gettime(CLOCK_REALTIME, &ts);
+	localtime_r(&ts.tv_sec, &tm);
+	strftime(when, sizeof(when), "%m-%d %H:%M:%S", &tm);
+	pthread_mutex_lock(&es_log_lock);
+	fprintf(es_log_out, "%s.%03ld %5d %5d %c %s: %s\n", when, ts.tv_nsec / 1000000, (int)getpid(), (int)gettid(),
+			"??VDIWEF"[priority & 7], tag ? tag : "", message ? message : "");
+	fflush(es_log_out);
+	pthread_mutex_unlock(&es_log_lock);
+}
+
+static void es_logger(const struct es_log_message *m) {
+	if (es_logd_logger) es_logd_logger(m);
+	if (es_log_out && m) es_log_line(m->priority, m->tag, m->message);
+}
+
+/*
+ Losing the DAC (ledger §A3 EVERSOLO TAKEOVER, EVERSOLO HOLDS NO DAC). When one of the A8's own sources
+ starts, the A8 gives it the DAC and kills our track ("dead IAudioTrack, Offloaded or Direct", then "Error
+ -32 obtaining an audio buffer, giving up"). Our output never noticed: it went on writing into nothing, LMS
+ showed it playing, and later tracks reused the dead stream, which the A8 never registered again, so it
+ never switched back to us. The A8 closes any other app's player the moment its own source registers;
+ ours is not closed (with the helper, the helper is), so it lets go of the DAC itself, as fast. A watcher
+ reads, every ES_WATCH_MS (the rate the A8 checks at), which app the A8 says has the audio; when that
+ changes from us to another, the output goes off as at an idle timeout (the stream closes and a monitor
+ waits) and LMS is asked to pause. The A8 switches its source (its play type) when the user picks one,
+ which can be long before its player registers: its own player, on a Qobuz track, first loads it, and it
+ sat at play type 5 with our output still registered while it never got going (2026-10-23 18:16). So while
+ our output is registered the watcher also reads the play type, from the A8's play-info API: once the A8
+ has shown us as its source (an outside app, ES_TYPE_OUTSIDE_APP), any other type is one of its own
+ sources, and the output goes off the same way. Pressing play then opens a fresh stream, which the A8
+ registers, switching to us as it does for any other app. A pause from LMS turns the output off at once
+ (slimproto.c), a stop after ES_IDLE_MS.
+ */
+#define ES_WATCH_MS 20          // EverSoloOnlineInfoManager checks for a source change this often
+#define ES_TYPE_MS 300          // the play type, while our output is registered
+#define ES_TYPE_OUTSIDE_APP 8   // the A8's play type for an outside app's audio (ours); 5 is its own player
+#define ES_MODE_MS 1000         // the A8's DSD output setting (a property: no request)
+static char es_me[PROP_VALUE_MAX] = "";   // the name the A8 registers us by: our process name
+static bool es_registered = false;        // the A8 has registered our output since it opened (lock O)
+static bool es_lost_by_writer = false;    // the DoP writer saw the DAC go (lock O), see es_output_lost
+static bool es_lost_was_playing = false;
+static volatile bool es_watching = false;
+static pthread_t es_watch_thread;
+
+// The play type the A8 shows, from the getState its remote app polls (a status line, no headers, the
+// JSON, then it closes), or -1 when it does not answer. Only the watcher calls it
+static int es_play_type(void) {
+	static const char req[] = "GET /ZidooMusicControl/v2/getState HTTP/1.0\r\nHost: 127.0.0.1:9529\r\n\r\n";
+	static char buf[16384]; // the reply is about 3 KB
+	struct sockaddr_in addr;
+	struct timeval tv = { 0, 500000 };
+	size_t got = 0;
+	ssize_t n;
+	char *p = NULL;
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(9529);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (!connect(fd, (struct sockaddr *)&addr, sizeof(addr)) && send(fd, req, sizeof(req) - 1, 0) == (ssize_t)(sizeof(req) - 1)) {
+		while (got < sizeof(buf) - 1 && (n = recv(fd, buf + got, sizeof(buf) - 1 - got, 0)) > 0) {
+			got += n;
+			buf[got] = '\0';
+			// the first is the top level's (everSoloPlayInfo repeats it); done once its number has ended
+			if ((p = strstr(buf, "\"playType\":")) && strpbrk(p + 11, ",}")) break;
+			p = NULL;
+		}
+	}
+	close(fd);
+	return p && isdigit((unsigned char)p[11]) ? atoi(p + 11) : -1;
+}
+
+static void es_read_me(void) {
+	FILE *f = fopen("/proc/self/cmdline", "r");
+	size_t n = 0;
+	if (f) {
+		n = fread(es_me, 1, sizeof(es_me) - 1, f);
+		fclose(f);
+	}
+	es_me[n] = '\0'; // the first argument: the name, up to its NUL
+}
+
+// called with the output lock held: whether the A8 says another app has the audio now
+bool es_dac_taken(void) {
+	char now[PROP_VALUE_MAX] = "";
+	__system_property_get("zidoo.music.package.now", now);
+	return es_me[0] && now[0] && strcmp(now, es_me) != 0;
+}
+
+// called with the output lock held, by the DoP writer when the sink failed because the DAC went: the
+// output goes off now, so its reopen does not take the DAC straight back; the watcher pauses LMS
+void es_output_lost(void) {
+	es_lost_was_playing = output.state != OUTPUT_STOPPED && output.state != OUTPUT_OFF;
+	output.state = OUTPUT_OFF;
+	es_registered = false;
+	es_lost_by_writer = true;
+}
+
+// one of Library's Eversolo hooks (no arguments), from the watcher's thread
+static void es_tell_app(const char *name) {
+	JNIEnv *env;
+	bool detached;
+	jmethodID method;
+	if (!jvm || !obj || !clazz) return;
+	detached = JNI_EDETACHED == (*jvm)->GetEnv(jvm, &env, JNI_VERSION_1_6);
+	if (detached && JNI_OK != (*jvm)->AttachCurrentThread(jvm, &env, NULL)) {
+		LOG_ERROR("Failed to get attach current thread");
+		return;
+	}
+	method = (*env)->GetMethodID(env, clazz, name, "()V");
+	if (method) {
+		(*env)->CallVoidMethod(env, obj, method);
+	} else {
+		(*env)->ExceptionClear(env);
+		LOG_ERROR("%s not found", name);
+	}
+	if (detached) {
+		(*jvm)->DetachCurrentThread(jvm);
+	}
+}
+
+static void es_pause_lms(void) {
+	es_tell_app("eversoloOutputLost");
+}
+
+// The A8's DSD output setting changed while the player runs. Between Native and DoP the next DSD track
+// follows it (dsd.c reads output.dsdfmt at each track start). To or from PCM it waits for the player to
+// restart: whether the player offers LMS DSD is told when it connects
+static void es_follow_dsd_mode(int was, int mode) {
+	if (es_dsd_mode_at_start == ES_DSD_PCM || mode == ES_DSD_PCM) {
+		LOG_INFO("Eversolo: its DSD output is now set to %s (was %s): that takes effect when the player restarts",
+				 es_dsd_mode_name(mode), es_dsd_mode_name(was));
+	} else {
+		bool native = mode == ES_DSD_NATIVE && es_native_ok();
+		dsd_format fmt;
+		mutex_lock(outputbuf->mutex);
+		fmt = _es_dsd_format(native);
+		mutex_unlock(outputbuf->mutex);
+		LOG_INFO("Eversolo: its DSD output is now set to %s: the next DSD track plays as %s", es_dsd_mode_name(mode),
+				 fmt == DSD_U32_BE ? "native DSD" : fmt == DOP ? "DoP" : "PCM (the sink failed earlier)");
+	}
+}
+
+static void *es_watch(void *arg) {
+	char now[PROP_VALUE_MAX];
+	u32_t active_since = 0, type_read_at = 0, mode_read_at = gettime_ms();
+	bool told_unregistered = false, told_no_type = false;
+	bool shown_ours = false; // the A8 has shown us as its source since our output opened
+	int mode = es_dsd_mode_at_start;
+	es_read_me(); // after any rename (es_name_process)
+	LOG_INFO("Eversolo: watching which app has the DAC, ours is '%s'", es_me);
+	while (es_watching) {
+		bool lost = false, was_playing = false, registered, newly_shown = false;
+		int type = -1, switched_to = -1;
+		if (gettime_ms() - mode_read_at >= ES_MODE_MS) {
+			int m = es_dsd_mode();
+			mode_read_at = gettime_ms();
+			if (m != mode) {
+				es_follow_dsd_mode(mode, m);
+				mode = m;
+			}
+		}
+		mutex_lock(outputbuf->mutex);
+		registered = output.state != OUTPUT_OFF && es_registered;
+		mutex_unlock(outputbuf->mutex);
+		// over HTTP, so outside the lock
+		if (registered && gettime_ms() - type_read_at >= ES_TYPE_MS) {
+			type_read_at = gettime_ms();
+			type = es_play_type();
+			if (type < 0 && !told_no_type) {
+				told_no_type = true;
+				LOG_INFO("Eversolo: its play type is not readable (getState on 127.0.0.1:9529)");
+			}
+		}
+		now[0] = '\0';
+		__system_property_get("zidoo.music.package.now", now);
+		mutex_lock(outputbuf->mutex);
+		if (output.state == OUTPUT_OFF) {
+			es_registered = false;
+			active_since = 0;
+			told_unregistered = false;
+			told_no_type = false;
+			shown_ours = false;
+		} else {
+			if (!active_since) active_since = gettime_ms();
+			if (!strcmp(now, es_me)) {
+				es_registered = true;
+				if (type == ES_TYPE_OUTSIDE_APP && !shown_ours) {
+					shown_ours = newly_shown = true;
+				} else if (shown_ours && type >= 0 && type != ES_TYPE_OUTSIDE_APP) {
+					switched_to = type;
+				}
+			}
+			if (switched_to >= 0 || (es_registered && strcmp(now, es_me))) {
+				was_playing = output.state != OUTPUT_STOPPED;
+				output.state = OUTPUT_OFF;
+				output.pa_reopen = true;
+				es_registered = false;
+				lost = true;
+			} else if (!es_registered && !told_unregistered && gettime_ms() - active_since > 3000) {
+				told_unregistered = true;
+				LOG_INFO("Eversolo: our output is not registered by the A8 after 3 s ('%s' has the DAC)", now);
+			}
+		}
+		if (es_lost_by_writer) {
+			was_playing = es_lost_was_playing;
+			es_lost_by_writer = false;
+			lost = true;
+		}
+		mutex_unlock(outputbuf->mutex);
+		if (newly_shown) {
+			LOG_INFO("Eversolo: the A8 shows us as its source (play type %d)", type);
+			es_tell_app("eversoloShowsUs"); // its volume becomes LMS's (EversoloVolume)
+		}
+		if (lost) {
+			if (switched_to >= 0) {
+				LOG_INFO("Eversolo: the A8 switched to one of its own sources (play type %d): output off%s",
+						 switched_to, was_playing ? ", LMS asked to pause" : "");
+			} else {
+				LOG_INFO("Eversolo: '%s' took the DAC: output off%s", now, was_playing ? ", LMS asked to pause" : "");
+			}
+			wake_controller();
+			if (was_playing) es_pause_lms();
+		}
+		usleep(ES_WATCH_MS * 1000);
+	}
+	return NULL;
+}
+
+static void es_watch_start(void) {
+	es_watching = true;
+	if (pthread_create(&es_watch_thread, NULL, es_watch, NULL)) {
+		es_watching = false;
+	}
+}
+
+static void es_watch_stop(void) {
+	if (es_watching) {
+		es_watching = false;
+		pthread_join(es_watch_thread, NULL);
+	}
+}
+
+static void *es_log_copy(void *arg) {
+	char cmd[80], line[1024];
+	FILE *in;
+	snprintf(cmd, sizeof(cmd), "logcat -v threadtime --pid=%d 2>&1", (int)getpid());
+	in = popen(cmd, "r");
+	if (!in) {
+		es_log_line(ANDROID_LOG_ERROR, "squeezelite", "cannot run logcat");
+		return NULL;
+	}
+	while (fgets(line, sizeof(line), in)) {
+		pthread_mutex_lock(&es_log_lock);
+		fputs(line, es_log_out);
+		fflush(es_log_out);
+		pthread_mutex_unlock(&es_log_lock);
+	}
+	es_log_line(ANDROID_LOG_ERROR, "squeezelite", "logcat ended");
+	pclose(in);
+	return NULL;
+}
+
+static void es_log_start(void) {
+	static bool started = false; // once per process: the logger stays for its life
+	void (*set_logger)(es_logger_fn) = NULL;
+	void *liblog;
+	char header[96];
+	pthread_t t;
+	if (started) return;
+	started = true;
+	es_log_out = es_log_fd >= 0 ? fdopen(es_log_fd, "w") : NULL;
+	if (!es_log_out) {
+		LOG_ERROR("Eversolo log: no log file (descriptor %d): %s", es_log_fd, strerror(errno));
+		return;
+	}
+	snprintf(header, sizeof(header), "log started, pid %d, Android API %d", (int)getpid(), android_get_device_api_level());
+	es_log_line(ANDROID_LOG_INFO, "squeezelite", header);
+	if ((liblog = dlopen("liblog.so", RTLD_NOW))) {
+		set_logger = (void (*)(es_logger_fn))dlsym(liblog, "__android_log_set_logger");
+		es_logd_logger = (es_logger_fn)dlsym(liblog, "__android_log_logd_logger");
+	}
+	if (set_logger && es_logd_logger) {
+		set_logger(es_logger);
+		es_log_line(ANDROID_LOG_INFO, "squeezelite", "logging through liblog's logger");
+	} else if (pthread_create(&t, NULL, es_log_copy, NULL) == 0) {
+		es_log_line(ANDROID_LOG_INFO, "squeezelite", "logging through a logcat copy");
+		pthread_detach(t);
+	}
+}
 #endif
 
 void send_output_state_to_app(u8_t spdif, u8_t dac) {
@@ -640,9 +1142,10 @@ void send_connection_state_to_app(const char *address) {
 	}
 }
 
-JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jobject jobj, jstring lms_param, jstring mac_param, jstring name_param, jint idle, jint fixed_vol, jint loglevel, jint mobile_network, jint buffer_size, jint force_opensles) {
+JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jobject jobj, jstring lms_param, jstring mac_param, jstring name_param, jint idle, jint fixed_vol, jint loglevel, jint mobile_network, jint buffer_size, jint force_opensles, jstring eversolo_name_param) {
 	const char *server = (*env)->GetStringUTFChars(env, lms_param, NULL);
 	const char *mac_str = (*env)->GetStringUTFChars(env, mac_param, NULL);
+	const char *eversolo_name = (*env)->GetStringUTFChars(env, eversolo_name_param, NULL);
 	char *output_device = "default";
 	char *include_codecs = NULL;
 	char *exclude_codecs = "";
@@ -688,7 +1191,8 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 
 	init_jvm(env, jobj);
 #if DSD
-	// FiiO players take native DSD through an AudioTrack, and the HiBy R5 through HiBy's own route.
+	// FiiO players take native DSD through an AudioTrack, the HiBy R5 through HiBy's own route, and
+	// Eversolo players (the DMP-A8) native DSD or DoP through Eversolo's own sink, as the A8 is set.
 	// Elsewhere the player does not offer DSD (no dsf/dff in what it tells LMS), so LMS converts it to
 	// PCM before sending it (the DSDPlayer plugin; without it LMS cannot play DSD here), at no more than
 	// the MaxSampleRate the player reports. Converted here it would run at the DSD rate / 8 with no
@@ -701,6 +1205,8 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 	// 32k to 384k and native DSD go through that instead, and the player offers rates up to 384k
 	pcm_track_on = !force_opensles && android_get_device_api_level() == __ANDROID_API_O_MR1__;
 	sas_on = pcm_track_on && !dsd_encoding && sas_init();
+	// Eversolo players (the DMP-A8): DSD through Eversolo's own sink. PCM stays as it was
+	es_on = !dsd_encoding && !sas_on && es_init();
 	if (dsd_encoding) {
 		// fiio_rates, resampling only a rate the route does not take (to one it does)
 		static char fiio_resample[] = "hE"; // process_init splits it in place
@@ -718,6 +1224,30 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 		user_rates = true;
 		max_rate = hiby_rates[0];
 		LOG_INFO("HiBy audio service: PCM up to %u and native DSD through it", hiby_rates[0]);
+	} else if (es_on) {
+		// DSD as the A8's DSD output setting says, as Eversolo's squeezelite follows it. Native DSD
+		// frames run at the DSD rate / 32: up to DSD512 (705.6k, the top of the DAC's AUDIO_FORMAT_DSD
+		// rates); DoP frames at the DSD rate / 16: up to DSD256 (705.6k, under the DAC's 768k). Higher
+		// DSD is converted here to PCM (output.dsd_max_rate, below). On PCM the player does not offer
+		// DSD, so LMS converts it. es_watch follows a later change of the setting
+		int mode = es_dsd_mode();
+		bool native = mode == ES_DSD_NATIVE && es_native_ok();
+		es_dsd_mode_at_start = mode;
+		dsd_outfmt = native ? DSD_U32_BE : DOP;
+		es_log_start();
+		if (eversolo_name && eversolo_name[0]) {
+			// the user's choice (app setting): the Eversolo's own now playing screen
+			es_name_process(eversolo_name);
+		}
+		if (mode == ES_DSD_PCM) {
+			exclude_codecs = "dsd";
+			LOG_INFO("Eversolo audio sink: the A8's DSD output is set to PCM: DSD is not offered to LMS, which converts it to PCM");
+		} else if (native) {
+			LOG_INFO("Eversolo audio sink: native DSD through it, up to DSD512 (the A8's DSD output is set to Native)");
+		} else {
+			LOG_INFO("Eversolo audio sink: DSD as DoP through it, up to DSD256 (the A8's DSD output is set to %s%s)",
+					 es_dsd_mode_name(mode), mode == ES_DSD_NATIVE ? ", but its output does not take native DSD" : "");
+		}
 	} else {
 		exclude_codecs = "dsd";
 		LOG_INFO("no native DSD: DSD is not offered to LMS, which converts it to PCM");
@@ -761,6 +1291,14 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 
 	stream_init(log_stream, stream_buf_size);
 
+#if DSD
+	if (es_on) {
+		// after the buffer size, which stays as it was when the probe gave these rates
+		memcpy(rates, es_rates, sizeof(es_rates));
+		user_rates = true;
+		idle = ES_IDLE_MS;
+	}
+#endif
 	output_init_pa(log_output, output_device, output_buf_size, output_params, rates, rate_delay, (unsigned int)idle, 0!=fixed_vol);
 
 #if DSD
@@ -769,6 +1307,11 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 		mutex_lock(outputbuf->mutex);
 		output.dsd_max_rate = 705600; // DSD256: DSD_U16_LE frames run at the DSD rate / 16
 		mutex_unlock(outputbuf->mutex);
+	} else if (es_on) {
+		mutex_lock(outputbuf->mutex);
+		output.dsd_max_rate = 705600; // DoP to DSD256 (the DSD rate / 16), native DSD to DSD512 (/ 32)
+		mutex_unlock(outputbuf->mutex);
+		es_watch_start(); // the output exists now: see es_watch
 	}
 	dsd_route_live(true);
 #endif
@@ -788,6 +1331,7 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 
 #if DSD
 	dsd_route_live(false);
+	es_watch_stop(); // before the output it reads goes
 #endif
 	output_close_pa();
 
@@ -798,6 +1342,7 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 	(*env)->ReleaseStringUTFChars(env, lms_param, server);
 	(*env)->ReleaseStringUTFChars(env, mac_param, mac_str);
 	(*env)->ReleaseStringUTFChars(env, name_param, name);
+	(*env)->ReleaseStringUTFChars(env, eversolo_name_param, eversolo_name);
 }
 
 JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_stop(JNIEnv * env, jobject jobj) {
@@ -825,6 +1370,30 @@ JNIEXPORT jint JNICALL Java_org_lyrion_squeezelite_Library_streamRate(JNIEnv * e
 	return (jint)output.current_raw_rate;
 #else
 	return 0;
+#endif
+}
+
+// For the Eversolo volume sync (EversoloVolume): whether the A8 has our audio as its own, its package.now
+// being our name, which it stays after a pause until another app plays; false until the watcher has
+// read our name
+JNIEXPORT jboolean JNICALL Java_org_lyrion_squeezelite_Library_eversoloOurs(JNIEnv * env, jobject jobj) {
+#if DSD
+	char now[PROP_VALUE_MAX] = "";
+	__system_property_get("zidoo.music.package.now", now);
+	return es_me[0] && !strcmp(now, es_me) ? JNI_TRUE : JNI_FALSE;
+#else
+	return JNI_FALSE;
+#endif
+}
+
+// And its mute flag, which its volume app sets at each mute and unmute (AudioMangerUtils.setDacIsMuteVolume)
+JNIEXPORT jboolean JNICALL Java_org_lyrion_squeezelite_Library_eversoloMuted(JNIEnv * env, jobject jobj) {
+#if DSD
+	char mute[PROP_VALUE_MAX] = "";
+	__system_property_get("persist.zidoo.dac.isMute", mute);
+	return !strcmp(mute, "1") ? JNI_TRUE : JNI_FALSE;
+#else
+	return JNI_FALSE;
 #endif
 }
 

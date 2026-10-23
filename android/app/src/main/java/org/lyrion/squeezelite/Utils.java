@@ -66,6 +66,38 @@ public class Utils {
         return true;
     }
 
+    // An Eversolo player (the DMP-A8): its firmware has Eversolo's audio sink, the route the native
+    // player plays DSD through there (android.c es_init)
+    public static boolean isEversolo() {
+        return new java.io.File("/system/lib64/libaudiosink.so").exists() ||
+               new java.io.File("/system/lib/libaudiosink.so").exists();
+    }
+
+    // The user chose the Eversolo's own now playing screen (Prefs.EVERSOLO_NOW_PLAYING_KEY): this app
+    // then shows none of its own
+    public static boolean useEversoloNowPlaying(Context context) {
+        return isEversolo() && Prefs.get(context).getBoolean(Prefs.EVERSOLO_NOW_PLAYING_KEY, Prefs.DEFAULT_EVERSOLO_NOW_PLAYING);
+    }
+
+    // The Squeezelite Eversolo helper app (the eversolo-helper module): it holds the media session the
+    // Eversolo's own now playing screen shows, so that the Eversolo closes it, not this player, when
+    // another source takes its DAC (EversoloHelperLink)
+    public static final String EVERSOLO_HELPER_PACKAGE = "org.lyrion.squeezelite.eversolo";
+
+    public static boolean isEversoloHelperInstalled(Context context) {
+        try {
+            context.getPackageManager().getPackageInfo(EVERSOLO_HELPER_PACKAGE, 0);
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        }
+    }
+
+    // The Eversolo's own now playing screen chosen, with the helper there to show it
+    public static boolean useEversoloHelper(Context context) {
+        return useEversoloNowPlaying(context) && isEversoloHelperInstalled(context);
+    }
+
     public static boolean isPlayerRunning(Context context) {
         ActivityManager manager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
         for (ActivityManager.RunningServiceInfo service : manager.getRunningServices(Integer.MAX_VALUE)) {

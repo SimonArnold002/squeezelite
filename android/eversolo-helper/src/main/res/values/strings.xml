@@ -1,0 +1,4 @@
+<resources>
+    <!-- The Eversolo's now playing screen shows this as the source -->
+    <string name="app_name">Squeezelite</string>
+</resources>

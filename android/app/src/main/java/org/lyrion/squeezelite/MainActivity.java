@@ -82,7 +82,7 @@ public class MainActivity extends AppCompatActivity {
                ) {
                 Utils.debug("Start player from launcher/app...");
                 startPlayer();
-                if (!askedToStartPlayer) {
+                if (!askedToStartPlayer && !Utils.useEversoloNowPlaying(this)) {
                     showNowPlaying();
                 }
                 finish();
@@ -91,9 +91,11 @@ public class MainActivity extends AppCompatActivity {
         }
 
         // From the launcher with the player running, show what it is playing; this screen is
-        // still reached from the now playing screen, which passes FROM_PLAYER_SERVICE_EXTRA
+        // still reached from the now playing screen, which passes FROM_PLAYER_SERVICE_EXTRA. Not with
+        // the Eversolo's own now playing screen chosen: this one shows then, as upstream
         Intent launch = getIntent();
-        if ((null==launch || !launch.getBooleanExtra(FROM_PLAYER_SERVICE_EXTRA, false)) && Utils.isPlayerRunning(this)) {
+        if ((null==launch || !launch.getBooleanExtra(FROM_PLAYER_SERVICE_EXTRA, false)) && Utils.isPlayerRunning(this) &&
+                !Utils.useEversoloNowPlaying(this)) {
             showNowPlaying();
             finish();
             return;
@@ -117,8 +119,10 @@ public class MainActivity extends AppCompatActivity {
                     ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.POST_NOTIFICATIONS}, PERMISSION_POST_NOTIFICATIONS);
                 } else {
                     startPlayer();
-                    showNowPlaying();
-                    finish();
+                    if (!Utils.useEversoloNowPlaying(this)) {
+                        showNowPlaying();
+                        finish();
+                    }
                 }
             }
         });
@@ -149,8 +153,10 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode == PERMISSION_POST_NOTIFICATIONS) {
             if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 startPlayer();
-                showNowPlaying();
-                finish();
+                if (!Utils.useEversoloNowPlaying(this)) {
+                    showNowPlaying();
+                    finish();
+                }
             }
             return;
         }

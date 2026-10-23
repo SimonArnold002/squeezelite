@@ -77,6 +77,17 @@ public class PlayerService extends MediaBrowserServiceCompat {
     private MediaSessionCompat mediaSession;
     private MediaSessionCompat.Callback mediaSessionCallback;
     private volatile NowPlaying nowPlaying;
+    // Eversolo's own call to bring its now playing screen up (EverSoloPlayInfoManager.f() in its player
+    // app): its launcher opens the screen on it (MainActivity's OpenMusicDetailBroadcastReceiver), unless
+    // the screen is already up, and isOpen tells the open screen's own receiver (DetailActivity's) to
+    // leave it as it is. Without isOpen, an open screen takes the broadcast as its remote app's request
+    // for the VU meters (openType 0), and switches to them
+    private static final String EVERSOLO_OPEN_NOW_PLAYING = "eversolo.openmusic.UI.action";
+    private static final String EVERSOLO_PLAYER_APP = "com.zidoo.streamer";
+    private boolean wasPlaying = false; // the last playback state, on the handler thread
+    // With the Eversolo's own now playing screen chosen and the helper app installed, the helper's
+    // copy of the session, which that screen shows (EversoloHelperLink)
+    private volatile EversoloHelperLink eversoloHelper = null;
     private volatile AudioFocus audioFocus;
     private volatile CarConnection carConnection;
     private boolean started = false;
@@ -199,7 +210,12 @@ public class PlayerService extends MediaBrowserServiceCompat {
             return null;
         }
         try {
-            Intent intent = new Intent(this, NowPlayingActivity.class);
+            // With the Eversolo's own now playing screen chosen, the settings screen, as upstream
+            boolean eversolo = Utils.useEversoloNowPlaying(this);
+            Intent intent = new Intent(this, eversolo ? MainActivity.class : NowPlayingActivity.class);
+            if (eversolo) {
+                intent.putExtra(MainActivity.FROM_PLAYER_SERVICE_EXTRA, true);
+            }
             // Back to the open screen, not another one on top of the settings screen
             intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             // CANCEL_CURRENT: a reused PendingIntent keeps the flags of the intent it was first
@@ -382,7 +398,12 @@ public class PlayerService extends MediaBrowserServiceCompat {
             // Only activate the session when there is something to publish - Android will not
             // relay its contents to connected devices otherwise
             mediaSession.setActive(true);
-            nowPlaying = new NowPlaying(this, lib, mediaSession);
+            // The player process is named after the helper on the same test (Library.startPlayer)
+            if (Utils.useEversoloHelper(this)) {
+                eversoloHelper = new EversoloHelperLink(this, lib);
+                eversoloHelper.bind();
+            }
+            nowPlaying = new NowPlaying(this, lib, mediaSession, eversoloHelper);
             nowPlaying.update();
         }
     }
@@ -400,6 +421,10 @@ public class PlayerService extends MediaBrowserServiceCompat {
         if (null!=nowPlaying) {
             nowPlaying.release();
             nowPlaying = null;
+        }
+        if (null!=eversoloHelper) {
+            eversoloHelper.release();
+            eversoloHelper = null;
         }
         if (null!=audioFocus) {
             audioFocus.release();
@@ -436,6 +461,18 @@ public class PlayerService extends MediaBrowserServiceCompat {
             if (null!=np) {
                 np.update();
             }
+            EversoloHelperLink helperLink = eversoloHelper;
+            if (playing && null!=helperLink) {
+                // The Eversolo closed the helper when another source played: back with playback
+                helperLink.playbackStarted();
+            }
+            // On an Eversolo set to its own now playing screen, bring that screen up when playback
+            // starts, as its own players do; only then, not on connecting, pausing or stopping
+            if (playing && !wasPlaying && Utils.useEversoloNowPlaying(this)) {
+                Utils.debug("Open the Eversolo's now playing screen");
+                sendBroadcast(new Intent(EVERSOLO_OPEN_NOW_PLAYING).setPackage(EVERSOLO_PLAYER_APP).putExtra("isOpen", true));
+            }
+            wasPlaying = playing;
         });
     }
 

@@ -83,6 +83,14 @@
             app:summary="@string/use_opensles_summary"
             app:title="@string/use_opensles"
             app:singleLineTitle="false"/>
+
+        <!-- Eversolo players only (hidden elsewhere, SettingsActivity) -->
+        <SwitchPreferenceCompat
+            app:iconSpaceReserved="false"
+            app:key="eversolo_now_playing"
+            app:summary="@string/eversolo_now_playing_summary"
+            app:title="@string/eversolo_now_playing"
+            app:singleLineTitle="false"/>
     </PreferenceCategory>
 
     <PreferenceCategory

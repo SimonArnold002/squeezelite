@@ -57,6 +57,8 @@ public class NowPlaying {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable queryTask = this::query;
     private final PlayerService service;
+    // The Eversolo helper app's copy of the session (EversoloHelperLink), or null
+    private final EversoloHelperLink eversoloHelper;
 
     private boolean released = false;
     private int retries = 0;
@@ -69,10 +71,11 @@ public class NowPlaying {
     private String formatText = null;
     private String description = null;
 
-    public NowPlaying(PlayerService service, Library lib, MediaSessionCompat session) {
+    public NowPlaying(PlayerService service, Library lib, MediaSessionCompat session, EversoloHelperLink eversoloHelper) {
         this.service = service;
         this.lib = lib;
         this.session = session;
+        this.eversoloHelper = eversoloHelper;
     }
 
     public void update() {
@@ -220,7 +223,7 @@ public class NowPlaying {
 
     private void setState(int state, long position) {
         this.state = state;
-        session.setPlaybackState(new PlaybackStateCompat.Builder()
+        PlaybackStateCompat playbackState = new PlaybackStateCompat.Builder()
                 .setActions(PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE |
                             PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_STOP |
                             PlaybackStateCompat.ACTION_SKIP_TO_NEXT |
@@ -228,16 +231,24 @@ public class NowPlaying {
                             PlaybackStateCompat.ACTION_SEEK_TO)
                 .setState(state, position, PlaybackStateCompat.STATE_PLAYING==state ? 1.0f : 0.0f,
                           SystemClock.elapsedRealtime())
-                .build());
+                .build();
+        session.setPlaybackState(playbackState);
+        if (null!=eversoloHelper) {
+            eversoloHelper.setPlaybackState(playbackState);
+        }
     }
 
     private void publishMetadata() {
         if (null==metadata) {
             return;
         }
-        session.setMetadata(metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, cover)
-                                    .putBitmap(MediaMetadataCompat.METADATA_KEY_ART, cover)
-                                    .build());
+        MediaMetadataCompat built = metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, cover)
+                                            .putBitmap(MediaMetadataCompat.METADATA_KEY_ART, cover)
+                                            .build();
+        session.setMetadata(built);
+        if (null!=eversoloHelper) {
+            eversoloHelper.setMetadata(built);
+        }
     }
 
     private String format(JSONObject track) {
