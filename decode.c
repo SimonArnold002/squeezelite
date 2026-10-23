@@ -255,19 +255,20 @@ unsigned decode_newstream(unsigned sample_rate, unsigned supported_rates[]) {
 	// called with O locked to get sample rate for potentially processed output stream
 	// release O mutex during process_newstream as it can take some time
 
-	IF_DSD(
-		output.next_raw_rate = sample_rate; // the output route check (output_pa.c) compares it
-		output.next_codec = codec ? codec->id : 0; // the app shows what LMS sends (android.c)
-	)
+	decode_stream_info(sample_rate);
 
 	MAY_PROCESS(
 		if (decode.process) {
 			// a copy, as the output route can change the rates while O is released (output_pa.c)
 			unsigned rates[MAX_SUPPORTED_SAMPLERATES];
 			memcpy(rates, supported_rates, sizeof(rates));
+			// until O is taken again the new stream's next_* are not set: the output route check
+			// and _pa_open read them (output_pa.c)
+			IF_DSD( output.next_unset = true; )
 			UNLOCK_O;
 			sample_rate = process_newstream(&decode.direct, sample_rate, rates);
 			LOCK_O;
+			IF_DSD( output.next_unset = false; )
 		}
 	);
 
@@ -278,6 +279,16 @@ unsigned decode_newstream(unsigned sample_rate, unsigned supported_rates[]) {
 	}
 
 	return sample_rate;
+}
+
+// called with O locked at each track start, through decode_newstream or not (native DSD, DoP): the
+// stream's own rate (before any processing; native DSD: its frame rate) and the codec decoding the
+// stream LMS sends, for the output route check (output_pa.c) and the app (android.c)
+void decode_stream_info(unsigned raw_rate) {
+	IF_DSD(
+		output.next_raw_rate = raw_rate;
+		output.next_codec = codec ? codec->id : 0;
+	)
 }
 
 void codec_open(u8_t format, u8_t sample_size, u8_t sample_rate, u8_t channels, u8_t endianness) {

@@ -631,6 +631,7 @@ void decode_init(log_level level, const char *include_codecs, const char *exclud
 void decode_close(void);
 void decode_flush(void);
 unsigned decode_newstream(unsigned sample_rate, unsigned supported_rates[]);
+void decode_stream_info(unsigned raw_rate);
 void codec_open(u8_t format, u8_t sample_size, u8_t sample_rate, u8_t channels, u8_t endianness);
 
 #if PROCESS
@@ -726,10 +727,11 @@ struct outputstate {
 	dsd_format dsdfmt;	       // set in dsd_init - output for DSD: DOP, DSD_U8, ...
 	unsigned dsd_delay;		   // set in dsd_init - delay in ms switching to/from dop
 	unsigned dsd_max_rate;     // highest DSD frame rate sent as native DSD, in place of supported_rates[0] (may be above it); 0 = supported_rates[0]
-	unsigned next_raw_rate;    // set in decode thread - the stream's own rate, before any resampling
+	unsigned next_raw_rate;    // set in decode thread at each track start - the stream's own rate, before any resampling (native DSD: its frame rate)
 	unsigned current_raw_rate; // next_raw_rate of the track playing; 0 = not known
-	char next_codec;           // set in decode thread - id of the codec decoding the stream LMS sends ('m' = mp3...)
+	char next_codec;           // set in decode thread at each track start - id of the codec decoding the stream LMS sends ('m' = mp3...)
 	char current_codec;        // next_codec of the track playing; 0 = not known
+	bool next_unset;           // set in decode thread while decode_newstream has O released: next_* are not yet the new stream's
 #endif
 };
 

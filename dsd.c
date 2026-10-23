@@ -820,6 +820,7 @@ static decode_state dsd_decode(void) {
 		} else {
 			LOG_INFO("DSD%u stream, format: %s, rate: %uHz\n", d->sample_rate / 44100, fmtstr, output.next_sample_rate);
 			output.fade = FADE_INACTIVE;
+			decode_stream_info(output.next_sample_rate);
 		}
 
 		output.next_fmt = outfmt;

@@ -39,7 +39,6 @@ import androidx.annotation.Keep;
 
 import com.android.volley.Response;
 
-import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.Arrays;
@@ -162,19 +161,14 @@ public class Library {
             Utils.info("USB audio output attached:" + usb + (usb ? ", rates:" + Arrays.toString(rates) : ""));
             boolean changed = null!=usbAttached && usbAttached!=usb;
             usbAttached = usb;
-            // Without native DSD (not a FiiO) the route changes nothing in the library, so no restart
-            int route = outputRoute(!usb, usb ? rates : null);
-            if (changed && ROUTE_NOT_APPLIED!=route) {
-                restartTrack(ROUTE_PCM_STALE==route);
+            // Whether a track the library has decoded would not play right on the new route; without
+            // native DSD (not a FiiO) the route changes nothing in the library, and the answer is no
+            boolean stale = outputRoute(!usb, usb ? rates : null);
+            if (changed && stale) {
+                restartTrack();
             }
         }
     }
-
-    // outputRoute's answer: not applied (no native DSD), applied, or applied and the PCM stream now
-    // playing runs at a rate the new route would not give it
-    private static final int ROUTE_NOT_APPLIED = 0;
-    private static final int ROUTE_APPLIED = 1;
-    private static final int ROUTE_PCM_STALE = 2;
 
     // LMS's type for a DSD file
     static boolean isDsdType(String type) {
@@ -219,29 +213,23 @@ public class Library {
     }
 
     // A track already decoded for the old route may not play right on the new one: native DSD
-    // into a USB DAC is silent, DSD128 or more as PCM (705.6k+) hangs the FiiO's own DAC, PCM at
-    // a rate a USB DAC cannot take is silent, and PCM resampled for a USB DAC that has gone would
-    // stay at that rate. So LMS streams it again from the same point, and the library decodes
-    // that for the new route. Paused, LMS only moves the resume point, and the new stream starts
-    // on resume. A PCM stream that cannot seek (radio) is left. Whether a PCM stream's rate is
-    // wrong for the new route comes from the library (pcmStale), which knows the stream's own rate
-    // and what it was resampled to; LMS's samplerate is the file's, not what LMS sends (maxBitrate).
-    private void restartTrack(boolean pcmStale) {
-        getStatus("tags:o", response -> {
+    // into a USB DAC is silent, PCM at a rate a USB DAC cannot take is silent, PCM resampled for a
+    // USB DAC that has gone would stay at that rate, and DSD played as PCM for one would stay PCM.
+    // The library judges that (outputRoute) for the track playing and the next one it has already
+    // decoded, from what it decoded them to: LMS's type and samplerate are the file's, not what LMS
+    // sends (maxBitrate, the DSD Player plugin). LMS then streams the track playing again from the
+    // same point, and the library decodes it, and the tracks after it, for the new route. Paused,
+    // LMS only moves the resume point, and the new stream starts on resume. A track LMS cannot seek
+    // (radio) is left, and so is the next one behind it.
+    private void restartTrack() {
+        // No track tags: mode, time and can_seek come with every status
+        getStatus("tags:", response -> {
             JSONObject result = null==response ? null : response.optJSONObject("result");
-            if (null==result || "stop".equals(result.optString("mode", "stop"))) {
+            if (null==result || "stop".equals(result.optString("mode", "stop")) || 1!=result.optInt("can_seek", 0)) {
                 return;
             }
-            JSONArray loop = result.optJSONArray("playlist_loop");
-            JSONObject track = null!=loop && loop.length()>0 ? loop.optJSONObject(0) : null;
-            boolean dsd = null!=track && isDsdType(track.optString("type", ""));
-            if (!dsd) {
-                if (null==track || !pcmStale || 1!=result.optInt("can_seek", 0)) {
-                    return;
-                }
-            }
             double time = result.optDouble("time", 0);
-            Utils.info("Output route changed: restart the " + (dsd ? "DSD" : "PCM") + " track at " + time);
+            Utils.info("Output route changed: restart the track at " + time);
             sendCommand(new String[]{"time", String.valueOf(time)});
         });
     }
@@ -573,9 +561,14 @@ public class Library {
     }
 
     // The format LMS sends the track playing in, as the library's codec id ('f' flac, 'm' mp3,
-    // 'd' dsd, 'p' pcm, 'l' alac, 'a' aac, 'o' ogg, 'u' opus); 0 when not known
+    // 'd' dsd, 'p' pcm, 'a' aac, 'o' ogg); 0 when not known
     public char getStreamCodec() {
         return loaded ? streamCodec() : 0;
+    }
+
+    // The rate LMS sends the track playing at, before the library resamples it; 0 when not known
+    public int getStreamRate() {
+        return loaded ? streamRate() : 0;
     }
 
     public void prev() {
@@ -639,6 +632,7 @@ public class Library {
 
     private native void start(String lms, String mac, String name, int idleTimeout, int fixedVolume, int logging, int mobileNetwork, int streamBuffer, int openSlEs);
     private native void stop();
-    private native int outputRoute(boolean dsdOk, int[] dacRates);
+    private native boolean outputRoute(boolean dsdOk, int[] dacRates);
     private native char streamCodec();
+    private native int streamRate();
 }

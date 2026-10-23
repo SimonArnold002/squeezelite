@@ -460,6 +460,7 @@ void output_flush(void) {
 	}
 	IF_DSD(
 	   output.current_codec = 0; // the next track's is known only at its start: the app shows none until then
+	   output.track_start = NULL; // the buffer is empty, so no track starts in it (output_pa.c reads a set one as the next track)
 	)
 	output.frames_played = 0;
 	UNLOCK;

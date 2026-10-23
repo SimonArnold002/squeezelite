@@ -25,10 +25,17 @@
 #include "squeezelite.h"
 #include <jni.h>
 #include <signal.h>
+#include <dlfcn.h>
+#include <unwind.h>
+#include <ucontext.h>
+#include <sys/prctl.h>
+#include <android/api-level.h>
 
 extern struct outputstate output;
 extern struct buffer *outputbuf;
 extern bool user_rates;
+extern bool pcm_track_on;
+extern bool sas_on;
 
 static JavaVM *jvm = NULL;
 static jclass clazz = 0;
@@ -48,8 +55,48 @@ static void sighandler(int signum) {
 /**
  Catch SEGV, log, and exit (normally). This is to prevent Android showing errors when stopping.
  */
-static void segv_handler(int sig) {
-	LOG_ERROR("SEGV/ABRT!");
+// TEST BUILD (dsdtest-30): log the crashing thread, the fault address and a backtrace first, to find
+// the crash at the R5's player shutdown (ledger R5 SHUTDOWN SEGV)
+struct crash_trace { uintptr_t pc[24]; int n; };
+
+static _Unwind_Reason_Code crash_frame(struct _Unwind_Context *ctx, void *arg) {
+	struct crash_trace *t = arg;
+	uintptr_t pc = _Unwind_GetIP(ctx);
+	if (pc && t->n < 24) t->pc[t->n++] = pc;
+	return t->n < 24 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+
+static void crash_where(const char *what, uintptr_t pc) {
+	Dl_info info;
+	if (pc && dladdr((void *)pc, &info) && info.dli_fname) {
+		LOG_ERROR("  %s %s+%#lx %s", what, info.dli_fname, (unsigned long)(pc - (uintptr_t)info.dli_fbase),
+				  info.dli_sname ? info.dli_sname : "");
+	} else {
+		LOG_ERROR("  %s %#lx", what, (unsigned long)pc);
+	}
+}
+
+static void segv_handler(int sig, siginfo_t *si, void *uc_void) {
+	ucontext_t *uc = uc_void;
+	struct crash_trace t = { .n = 0 };
+	char name[17] = "";
+	int i;
+	prctl(PR_GET_NAME, name);
+	LOG_ERROR("SEGV/ABRT! signal %d code %d addr %p, thread %d '%s'", sig, si ? si->si_code : 0,
+			  si ? si->si_addr : NULL, gettid(), name);
+#if defined(__aarch64__)
+	crash_where("pc", uc->uc_mcontext.pc);
+	crash_where("lr", uc->uc_mcontext.regs[30]);
+#elif defined(__arm__)
+	crash_where("pc", uc->uc_mcontext.arm_pc);
+	crash_where("lr", uc->uc_mcontext.arm_lr);
+#endif
+	_Unwind_Backtrace(crash_frame, &t);
+	for (i = 0; i < t.n; i++) {
+		char what[8];
+		snprintf(what, sizeof(what), "#%02d", i);
+		crash_where(what, t.pc[i]);
+	}
 	exit(0);
 }
 
@@ -74,7 +121,8 @@ static void set_dsd_loglevel(log_level level) {
  Native DSD on FiiO players. FiiO's Android adds AudioFormat.ENCODING_DSD_32BIT; an AudioTrack
  opened with it is routed to the DAC's DSD path. The track rate is the DSD bit rate / 32, and
  the data is the DSD_U16_LE byte stream (16-bit L/R interleave, earliest bit in the MSB),
- packed by output_pa.c. Only the DSD writer thread in output_pa.c calls the dsd_track functions.
+ packed by output_pa.c. Only the writer threads in output_pa.c, one at a time, call the track
+ functions below (the DSD writer, and the PCM writer on Android 8.1).
  */
 static int dsd_encoding = 0;
 
@@ -105,17 +153,22 @@ static void dsd_route_live(bool live) {
 	pthread_mutex_unlock(&route_mutex);
 }
 
+// The writer's AudioTrack: native DSD, or PCM on Android 8.1 (pcm_track_open), written as floats.
+// output_pa.c runs one writer at a time, so the two share these
 static JNIEnv *dsd_env = NULL;
 static jobject dsd_track = NULL;
 static jbyteArray dsd_array = NULL;
 static jint dsd_array_len = 0;
-static jmethodID dsd_write_id, dsd_head_id;
+static jfloatArray pcm_array = NULL;
+static jint pcm_array_len = 0;
+static jmethodID dsd_write_id, pcm_write_id, dsd_head_id;
+static const char *track_kind = "DSD"; // for the log
 
 static bool jni_failed(JNIEnv *env, const char *what) {
 	if ((*env)->ExceptionCheck(env)) {
 		(*env)->ExceptionDescribe(env);
 		(*env)->ExceptionClear(env);
-		LOG_ERROR("DSD AudioTrack: %s failed", what);
+		LOG_ERROR("%s AudioTrack: %s failed", track_kind, what);
 		return true;
 	}
 	return false;
@@ -173,15 +226,47 @@ static bool set(JNIEnv *env, jobject builder, const char *name, const char *ret,
 	return true;
 }
 
-// local refs left behind on a failure are freed by DetachCurrentThread
-bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes) {
+// the same for a setter taking an object
+static bool set_object(JNIEnv *env, jobject builder, const char *name, const char *sig, jobject arg) {
+	jclass cls = (*env)->GetObjectClass(env, builder);
+	jmethodID id = (*env)->GetMethodID(env, cls, name, sig);
+	jobject next = NULL;
+	(*env)->DeleteLocalRef(env, cls);
+	if (jni_failed(env, name) || !id) return false;
+	next = (*env)->CallObjectMethod(env, builder, id, arg);
+	if (jni_failed(env, name) || !next) return false;
+	(*env)->DeleteLocalRef(env, next);
+	return true;
+}
+
+// AudioTrack.Builder in PERFORMANCE_MODE_POWER_SAVING (API 26), which asks for a deep buffer
+// output; NULL (exception cleared) on a failure
+static jobject build_power_saving(JNIEnv *env, jobject attrs, jobject format, unsigned buffer_bytes) {
+	jclass cls = (*env)->FindClass(env, "android/media/AudioTrack$Builder");
+	jobject b = (*env)->NewObject(env, cls, (*env)->GetMethodID(env, cls, "<init>", "()V"));
+	(*env)->DeleteLocalRef(env, cls);
+	if (jni_failed(env, "AudioTrack.Builder")) return NULL;
+	if (!set_object(env, b, "setAudioAttributes", "(Landroid/media/AudioAttributes;)Landroid/media/AudioTrack$Builder;", attrs) ||
+		!set_object(env, b, "setAudioFormat", "(Landroid/media/AudioFormat;)Landroid/media/AudioTrack$Builder;", format) ||
+		!set(env, b, "setBufferSizeInBytes", "Landroid/media/AudioTrack$Builder;", buffer_bytes) ||
+		!set(env, b, "setTransferMode", "Landroid/media/AudioTrack$Builder;", 1) || // MODE_STREAM
+		!set(env, b, "setPerformanceMode", "Landroid/media/AudioTrack$Builder;", 2)) { // PERFORMANCE_MODE_POWER_SAVING
+		return NULL;
+	}
+	return build(env, b, "()Landroid/media/AudioTrack;");
+}
+
+// Opens a playing AudioTrack (USAGE_MEDIA, CONTENT_TYPE_MUSIC, stereo) into dsd_track, on this
+// thread, which stays attached until dsd_track_close. Native DSD uses the constructor;
+// power_saving uses build_power_saving. Local refs left behind on a failure are freed by
+// DetachCurrentThread
+static bool track_open(int encoding, unsigned rate, unsigned buffer_bytes, bool power_saving) {
 	JNIEnv *env;
 	jclass cls;
 	jobject b, attrs, format, track = NULL;
 
-	if (!jvm || !dsd_encoding) return false;
 	if ((*jvm)->AttachCurrentThread(jvm, &env, NULL) != JNI_OK) {
-		LOG_ERROR("DSD AudioTrack: failed to attach thread");
+		LOG_ERROR("%s AudioTrack: failed to attach thread", track_kind);
 		return false;
 	}
 	dsd_env = env;
@@ -199,22 +284,27 @@ bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes) 
 	b = (*env)->NewObject(env, cls, (*env)->GetMethodID(env, cls, "<init>", "()V"));
 	(*env)->DeleteLocalRef(env, cls);
 	if (jni_failed(env, "AudioFormat.Builder")) goto fail;
-	if (!set(env, b, "setEncoding", "Landroid/media/AudioFormat$Builder;", dsd_encoding) ||
+	if (!set(env, b, "setEncoding", "Landroid/media/AudioFormat$Builder;", encoding) ||
 		!set(env, b, "setSampleRate", "Landroid/media/AudioFormat$Builder;", rate) ||
 		!set(env, b, "setChannelMask", "Landroid/media/AudioFormat$Builder;", 0xC) || // CHANNEL_OUT_STEREO
 		!(format = build(env, b, "()Landroid/media/AudioFormat;"))) goto fail;
 	(*env)->DeleteLocalRef(env, b);
 
 	cls = (*env)->FindClass(env, "android/media/AudioTrack");
-	track = (*env)->NewObject(env, cls, (*env)->GetMethodID(env, cls, "<init>",
-							  "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V"),
-							  attrs, format, (jint)buffer_bytes, 1 /* MODE_STREAM */, 0 /* AUDIO_SESSION_ID_GENERATE */);
-	if (jni_failed(env, "AudioTrack")) goto fail;
+	if (power_saving) {
+		if (!(track = build_power_saving(env, attrs, format, buffer_bytes))) goto fail;
+	} else {
+		track = (*env)->NewObject(env, cls, (*env)->GetMethodID(env, cls, "<init>",
+								  "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V"),
+								  attrs, format, (jint)buffer_bytes, 1 /* MODE_STREAM */, 0 /* AUDIO_SESSION_ID_GENERATE */);
+		if (jni_failed(env, "AudioTrack")) goto fail;
+	}
 	dsd_write_id = (*env)->GetMethodID(env, cls, "write", "([BII)I");
+	pcm_write_id = (*env)->GetMethodID(env, cls, "write", "([FIII)I");
 	dsd_head_id = (*env)->GetMethodID(env, cls, "getPlaybackHeadPosition", "()I");
 	if ((*env)->CallIntMethod(env, track, (*env)->GetMethodID(env, cls, "getState", "()I")) != 1) { // STATE_INITIALIZED
 		jni_failed(env, "getState");
-		LOG_ERROR("DSD AudioTrack: not initialised at %u", rate);
+		LOG_ERROR("%s AudioTrack: not initialised at %u", track_kind, rate);
 		goto fail;
 	}
 	(*env)->CallVoidMethod(env, track, (*env)->GetMethodID(env, cls, "play", "()V"));
@@ -222,23 +312,56 @@ bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes) 
 	(*env)->DeleteLocalRef(env, cls);
 
 	dsd_track = (*env)->NewGlobalRef(env, track);
-	dsd_array = (*env)->NewGlobalRef(env, (*env)->NewByteArray(env, chunk_bytes));
-	dsd_array_len = chunk_bytes;
 	(*env)->DeleteLocalRef(env, track);
 	(*env)->DeleteLocalRef(env, attrs);
 	(*env)->DeleteLocalRef(env, format);
-	LOG_INFO("DSD AudioTrack open: rate %u, encoding %d, buffer %u bytes", rate, dsd_encoding, buffer_bytes);
 	return true;
 
 fail:
 	if (track) {
-		// release now: an unreleased track holds the DSD output until the GC finalizes it
+		// release now: an unreleased track holds the output until the GC finalizes it
 		(*env)->CallVoidMethod(env, track, (*env)->GetMethodID(env, cls, "release", "()V"));
 		jni_failed(env, "release");
 	}
 	(*jvm)->DetachCurrentThread(jvm);
 	dsd_env = NULL;
 	return false;
+}
+
+bool dsd_track_open(unsigned rate, unsigned buffer_bytes, unsigned chunk_bytes) {
+	JNIEnv *env;
+
+	if (!jvm || !dsd_encoding) return false;
+	track_kind = "DSD";
+	if (!track_open(dsd_encoding, rate, buffer_bytes, false)) return false;
+	env = dsd_env;
+	dsd_array = (*env)->NewGlobalRef(env, (*env)->NewByteArray(env, chunk_bytes));
+	dsd_array_len = chunk_bytes;
+	LOG_INFO("DSD AudioTrack open: rate %u, encoding %d, buffer %u bytes", rate, dsd_encoding, buffer_bytes);
+	return true;
+}
+
+// PCM on Android 8.1 (output_pa.c pcm_writer): stereo ENCODING_PCM_FLOAT at rate with a buffer of
+// buffer_frames, written in chunks of up to chunk_frames. In power saving mode, which on the HiBy R5
+// gives the deep buffer direct output that OpenSL ES and AAudio test streams played on without a
+// fault; the AAudio run the R5's driver deadlocked on asked for no mode
+bool pcm_track_open(unsigned rate, unsigned buffer_frames, unsigned chunk_frames) {
+	JNIEnv *env;
+	jclass cls;
+	jint frames;
+
+	if (!jvm) return false;
+	track_kind = "PCM";
+	if (!track_open(4 /* ENCODING_PCM_FLOAT */, rate, buffer_frames * 8, true)) return false;
+	env = dsd_env;
+	pcm_array = (*env)->NewGlobalRef(env, (*env)->NewFloatArray(env, chunk_frames * 2));
+	pcm_array_len = chunk_frames * 2;
+	cls = (*env)->GetObjectClass(env, dsd_track);
+	frames = (*env)->CallIntMethod(env, dsd_track, (*env)->GetMethodID(env, cls, "getBufferSizeInFrames", "()I"));
+	if (jni_failed(env, "getBufferSizeInFrames")) frames = 0;
+	(*env)->DeleteLocalRef(env, cls);
+	LOG_INFO("PCM AudioTrack open: rate %u, float, buffer %d frames (%u asked)", rate, frames, buffer_frames);
+	return true;
 }
 
 // blocking write of the whole buffer; returns false on a write error
@@ -252,6 +375,25 @@ bool dsd_track_write(const u8_t *buf, unsigned len) {
 		if (jni_failed(env, "write")) return false;
 		if (n <= 0) { // 0 = the track was paused or stopped under us: never spin on it
 			LOG_ERROR("DSD AudioTrack: write error %d", n);
+			return false;
+		}
+		done += n;
+	}
+	return true;
+}
+
+// the same for frames stereo float frames (pcm_track_open)
+bool pcm_track_write(const float *buf, unsigned frames) {
+	JNIEnv *env = dsd_env;
+	unsigned len = frames * 2, done = 0;
+	if (!env || !dsd_track || !pcm_array || len > (unsigned)pcm_array_len) return false;
+	(*env)->SetFloatArrayRegion(env, pcm_array, 0, len, buf);
+	while (done < len) {
+		jint n = (*env)->CallIntMethod(env, dsd_track, pcm_write_id, pcm_array, (jint)done, (jint)(len - done),
+									   0 /* WRITE_BLOCKING */);
+		if (jni_failed(env, "write")) return false;
+		if (n <= 0) { // 0 = the track was paused or stopped under us: never spin on it
+			LOG_ERROR("PCM AudioTrack: write error %d", n);
 			return false;
 		}
 		done += n;
@@ -285,9 +427,95 @@ void dsd_track_close(void) {
 		(*env)->DeleteGlobalRef(env, dsd_array);
 		dsd_array = NULL;
 	}
+	if (pcm_array) {
+		(*env)->DeleteGlobalRef(env, pcm_array);
+		pcm_array = NULL;
+	}
 	(*jvm)->DetachCurrentThread(jvm);
 	dsd_env = NULL;
-	LOG_INFO("DSD AudioTrack closed");
+	LOG_INFO("%s AudioTrack closed", track_kind);
+}
+
+/*
+ HiBy's own route to its DAC (the R5, Android 8.1). Its firmware has libsmartaudioservice.so, listed in
+ /system/etc/public.libraries.txt so that any app may load it, and HiBy Music plays through it. It builds
+ Android's native AudioTrack, which has no 192k limit, on the R5's offload output (PCM 32k-768k). There is
+ no header: the calls below are read from its arm64 code (ledger §A3 HIBY'S OWN ROUTE). create_track
+ returns a table of functions, each taking the table first. Only the PCM writer in output_pa.c uses it.
+ */
+struct sas_track {
+	size_t (*write)(struct sas_track *t, const void *buf, size_t bytes); // blocking; returns bytes, 0 = no AudioTrack
+	void (*stop)(struct sas_track *t);
+	void (*stop2)(struct sas_track *t);
+	void (*start)(struct sas_track *t);
+	void (*flush)(struct sas_track *t);
+	int (*playing)(struct sas_track *t);
+	int (*latency)(struct sas_track *t);  // AudioTrack::latency(), ms
+	int (*rate)(struct sas_track *t);
+	int (*channels)(struct sas_track *t);
+	int (*unknown)(struct sas_track *t);
+	void *ctx;
+};
+static struct sas_track *(*sas_create)(int rate, int channels, int format, int unused); // format 3: 32-bit PCM, 5: DSD
+static void (*sas_release)(struct sas_track *t);
+static struct sas_track *sas_track = NULL;
+
+// The rates the player offers through it: its offload output takes 32k-768k, and 384k is the R5's
+// own limit. Below 32k PCM goes to OpenSL ES
+static const unsigned hiby_rates[] = { 384000, 352800, 192000, 176400, 96000, 88200, 48000, 44100,
+									   32000, 24000, 22050, 16000, 12000, 11025, 8000 };
+
+static bool sas_init(void) {
+	void *lib = dlopen("libsmartaudioservice.so", RTLD_NOW);
+	if (!lib) return false;
+	sas_create = dlsym(lib, "create_track");
+	sas_release = dlsym(lib, "release_track");
+	if (!sas_create || !sas_release) {
+		dlclose(lib);
+		return false;
+	}
+	return true;
+}
+
+// A playing track at rate frames a second: 32-bit PCM, or with dsd native DSD, whose frames hold 32
+// bits a channel (format 5: create_track takes the DSD rate and runs the track at a 32nd of it).
+// Returns its latency in ms, or -1 when it failed
+int sas_track_open(unsigned rate, bool dsd) {
+	unsigned asked = dsd ? rate * 32 : rate;
+	struct sas_track *t = sas_create((int)asked, 2, dsd ? 5 : 3, 0);
+	int latency;
+	if (!t) {
+		LOG_ERROR("HiBy track: create_track failed at %u%s", asked, dsd ? " (DSD)" : "");
+		return -1;
+	}
+	// the table holds what was asked: else it is not the one read from the R5's library
+	if (t->rate(t) != (int)asked || t->channels(t) != 2) {
+		LOG_ERROR("HiBy track: unknown create_track table at %u", asked);
+		sas_release(t);
+		return -1;
+	}
+	t->start(t);
+	latency = t->latency(t);
+	sas_track = t;
+	if (dsd) {
+		LOG_INFO("HiBy track open: native DSD%u at %u, latency %d ms", asked / 44100, rate, latency);
+	} else {
+		LOG_INFO("HiBy track open: rate %u, 32-bit, latency %d ms", rate, latency);
+	}
+	return latency;
+}
+
+// blocking write of the whole buffer; false when the track has no AudioTrack
+bool sas_track_write(const u8_t *buf, unsigned bytes) {
+	return sas_track && sas_track->write(sas_track, buf, bytes) == bytes;
+}
+
+void sas_track_close(void) {
+	if (sas_track) {
+		sas_release(sas_track);
+		sas_track = NULL;
+		LOG_INFO("HiBy track closed");
+	}
 }
 #endif
 
@@ -460,9 +688,19 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 
 	init_jvm(env, jobj);
 #if DSD
-	// FiiO players take native DSD through an AudioTrack; elsewhere DSD is converted to PCM
+	// FiiO players take native DSD through an AudioTrack, and the HiBy R5 through HiBy's own route.
+	// Elsewhere the player does not offer DSD (no dsf/dff in what it tells LMS), so LMS converts it to
+	// PCM before sending it (the DSDPlayer plugin; without it LMS cannot play DSD here), at no more than
+	// the MaxSampleRate the player reports. Converted here it would run at the DSD rate / 8 with no
+	// resampler to lower it (that is the FiiO's only): DSD128 at 705.6k, which OpenSL ES refused on a
+	// HiBy R5 (Android 8.1)
 	set_dsd_loglevel(loglevel);
 	dsd_encoding = find_dsd_encoding(env);
+	// Android 8.1 (the HiBy R5): PCM from 48k up plays through a Java AudioTrack (output_pa.c
+	// pcm_writer), unless the user forces OpenSL ES. Where HiBy's own route is there (the R5), PCM from
+	// 32k to 384k and native DSD go through that instead, and the player offers rates up to 384k
+	pcm_track_on = !force_opensles && android_get_device_api_level() == __ANDROID_API_O_MR1__;
+	sas_on = pcm_track_on && !dsd_encoding && sas_init();
 	if (dsd_encoding) {
 		// fiio_rates, resampling only a rate the route does not take (to one it does)
 		static char fiio_resample[] = "hE"; // process_init splits it in place
@@ -472,6 +710,17 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 		user_rates = true;
 		resample = fiio_resample;
 		max_rate = fiio_rates[0]; // what LMS is told, whatever DAC the route goes to when it connects
+	} else if (sas_on) {
+		// DSD as 32-bit words at the DSD rate / 32, the rate HiBy's DSD track runs at, up to DSD256
+		// (352.8k, under the 384k the player offers); higher DSD is converted here to PCM
+		dsd_outfmt = DSD_U32_LE;
+		memcpy(rates, hiby_rates, sizeof(hiby_rates));
+		user_rates = true;
+		max_rate = hiby_rates[0];
+		LOG_INFO("HiBy audio service: PCM up to %u and native DSD through it", hiby_rates[0]);
+	} else {
+		exclude_codecs = "dsd";
+		LOG_INFO("no native DSD: DSD is not offered to LMS, which converts it to PCM");
 	}
 #endif
 	signal(SIGINT, sighandler);
@@ -482,17 +731,24 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_start(JNIEnv *env, jo
 #if defined(SIGHUP)
 	signal(SIGHUP, sighandler);
 #endif
-	signal(SIGSEGV, segv_handler);
-	signal(SIGABRT, segv_handler);
+	{
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_sigaction = segv_handler;
+		sa.sa_flags = SA_SIGINFO;
+		sigaction(SIGSEGV, &sa, NULL);
+		sigaction(SIGABRT, &sa, NULL);
+	}
 
 #if USE_SSL && !LINKALL && !NO_SSLSYM
 	ssl_loaded = load_ssl_symbols();
 #endif
 
 	// set the output buffer size if not specified on the command line, take account of resampling
+	// and of rates above 192k
 	if (!output_buf_size) {
 		output_buf_size = OUTPUTBUF_SIZE;
-		if (resample) {
+		if (resample || rates[0] > 192000) {
 			unsigned scale = 8;
 			if (rates[0]) {
 				scale = rates[0] / 44100;
@@ -549,8 +805,9 @@ JNIEXPORT void JNICALL Java_org_lyrion_squeezelite_Library_stop(JNIEnv * env, jo
 }
 
 // The id of the codec decoding the track playing, so of the format LMS sends it in ('f' flac,
-// 'm' mp3, 'd' dsd, 'p' pcm, 'l' alac, 'a' aac, 'o' ogg, 'u' opus); 0 before the first track.
-// Read without the lock: one byte, set at each track start
+// 'm' mp3, 'd' dsd, 'p' pcm, 'a' aac, 'o' ogg: the codecs this build has); 0 when not known (before
+// the first track, and from a flush to the next track start). Read without the lock, as
+// streamRate: one value each, set at each track start
 JNIEXPORT jchar JNICALL Java_org_lyrion_squeezelite_Library_streamCodec(JNIEnv * env, jobject jobj) {
 #if DSD
 	return (jchar)(unsigned char)output.current_codec;
@@ -559,14 +816,26 @@ JNIEXPORT jchar JNICALL Java_org_lyrion_squeezelite_Library_streamCodec(JNIEnv *
 #endif
 }
 
+// The rate of the stream LMS sends the track playing in, before the library resamples it (native
+// DSD: its frame rate); 0 when not known. Read without the lock: at a track start this and
+// streamCodec can come from different tracks for one read, and the status query that follows the
+// track start (STMs) reads both again
+JNIEXPORT jint JNICALL Java_org_lyrion_squeezelite_Library_streamRate(JNIEnv * env, jobject jobj) {
+#if DSD
+	return (jint)output.current_raw_rate;
+#else
+	return 0;
+#endif
+}
+
 // dsd_ok is false while a USB audio device is attached: the FiiO routes to it, and it cannot play
 // the DSD track. dac_rates are that device's rates, NULL or empty when not known (the player's own
-// are kept); those above the player's own maximum are dropped. Returns Library's ROUTE_ values:
-// 0 not applied (the output module is down, or there is no native DSD, so not a FiiO: the route
-// changes nothing), 1 applied, 2 applied and the PCM track playing is at a rate the new route
-// would not give it (output_route_pa).
-JNIEXPORT jint JNICALL Java_org_lyrion_squeezelite_Library_outputRoute(JNIEnv * env, jobject jobj, jboolean dsd_ok, jintArray dac_rates) {
-	jint route = 0;
+// are kept); those above the player's own maximum are dropped. Returns whether Library should have
+// LMS stream the track playing again: a track in the buffer, decoded for the old route, would not
+// play right on the new one (output_route_pa). False when the route is not applied: the output
+// module is down, or there is no native DSD (not a FiiO: the route changes nothing).
+JNIEXPORT jboolean JNICALL Java_org_lyrion_squeezelite_Library_outputRoute(JNIEnv * env, jobject jobj, jboolean dsd_ok, jintArray dac_rates) {
+	jboolean restart = JNI_FALSE;
 #if DSD
 	unsigned rates[MAX_SUPPORTED_SAMPLERATES] = { 0 };
 	unsigned n = 0;
@@ -591,8 +860,8 @@ JNIEXPORT jint JNICALL Java_org_lyrion_squeezelite_Library_outputRoute(JNIEnv * 
 	route_ok = dsd_ok;
 	route_dac = n > 0;
 	memcpy(route_rates, rates, sizeof(route_rates));
-	if (route_live) route = output_route_pa(route_ok, route_dac ? route_rates : NULL) ? 2 : 1;
+	if (route_live && output_route_pa(route_ok, route_dac ? route_rates : NULL)) restart = JNI_TRUE;
 	pthread_mutex_unlock(&route_mutex);
 #endif
-	return route;
+	return restart;
 }

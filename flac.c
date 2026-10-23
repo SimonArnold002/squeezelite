@@ -191,6 +191,7 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 				output.next_fmt = DOP;
 			output.next_sample_rate = frame->header.sample_rate;
 			output.fade = FADE_INACTIVE;
+			decode_stream_info(frame->header.sample_rate);
 		} else {
 			output.next_sample_rate = decode_newstream(frame->header.sample_rate, output.supported_rates);
 			output.next_fmt = PCM;

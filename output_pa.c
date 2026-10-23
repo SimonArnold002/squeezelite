@@ -61,6 +61,7 @@ static unsigned paNumberOfBuffers = 4;
 
 #if defined(ANDROID) && DSD
 #define ANDROID_DSD 1
+#include <sys/resource.h>
 #else
 #define ANDROID_DSD 0
 #endif
@@ -70,8 +71,8 @@ static struct {
 	unsigned rate;
 	PaStream *stream;
 #if ANDROID_DSD
-	u8_t fmt;        // output.outfmt the open stream or DSD track was opened for
-	bool dsd;        // a DSD writer thread owns the output instead of pa.stream
+	u8_t fmt;        // output.outfmt the open stream or writer's track was opened for
+	bool dsd;        // a writer thread (dsd_writer, or pcm_writer) owns the output instead of pa.stream
 #endif
 } pa;
 
@@ -289,6 +290,29 @@ static bool dsd_refused = false;     // the DAC refused DSD: PCM until the playe
 static bool dsd_route_ok = true;     // the output route takes native DSD (output_route_pa)
 static unsigned dsd_route_gen = 0;   // bumped at each route change, followed by the writer
 static unsigned own_rates[MAX_SUPPORTED_SAMPLERATES]; // the player's rates, for the FiiO's own DAC
+static bool pcm_track_refused = false; // the PCM AudioTrack failed: portaudio until the player restarts
+static bool sas_refused = false;     // HiBy's track failed: the AudioTrack or portaudio until the player restarts
+static bool sas_dsd_refused = false; // HiBy's DSD track failed: DSD as PCM until the player restarts
+static bool pcm_sas = false;         // the PCM writer running uses HiBy's track, not a Java AudioTrack
+
+bool pcm_track_on = false;           // set by android.c before output_init_pa: Android 8.1, see pcm_writer
+bool sas_on = false;                 // set by android.c before output_init_pa: HiBy's own route, see pcm_writer
+#define PCM_TRACK_MIN_RATE 48000     // the HiBy R5 plays 48k and up on a direct output, and mixes below it
+#define PCM_TRACK_MAX_RATE 192000    // Android 8.1's Java AudioTrack refuses more
+#define PCM_TRACK_MS 250             // the PCM AudioTrack's buffer
+#define SAS_MIN_RATE 32000           // HiBy's offload output takes 32k-768k; the player offers up to 384k
+#define SAS_MAX_RATE 384000
+
+// called with the output lock held: whether a PCM stream at rate goes to HiBy's track
+static bool pcm_sas_takes(unsigned rate) {
+	return sas_on && !sas_refused && rate >= SAS_MIN_RATE && rate <= SAS_MAX_RATE;
+}
+
+// called with the output lock held: whether a PCM stream at rate goes to pcm_writer, not portaudio
+static bool pcm_writer_takes(unsigned rate) {
+	return pcm_sas_takes(rate) ||
+		   (pcm_track_on && !pcm_track_refused && rate >= PCM_TRACK_MIN_RATE && rate <= PCM_TRACK_MAX_RATE);
+}
 #endif
 
 static thread_type monitor_thread;
@@ -381,8 +405,11 @@ void _pa_open(void) {
 	// a DSD track opens a native DSD track first, and the reverse opens PCM for a DSD track. The rate
 	// goes with it, as a DSD frame rate opened as PCM (705.6k after DSD256) hangs the FiiO's DAC. The
 	// track start then has nothing to change. A PCM rate change alone is left as upstream has it.
+	// Not while decode_newstream has O released: the next track's start is set, but next_* are still
+	// the last stream's, or those of a track LMS flushed. The output then opens as it was, and the
+	// track start reopens it.
 	if (output.state != OUTPUT_OFF && output.track_start && output.track_start == outputbuf->readp &&
-		output.outfmt != output.next_fmt) {
+		!output.next_unset && output.outfmt != output.next_fmt) {
 		LOG_INFO("output opens for the next track: %s at %u", output.next_fmt == DSD_U16_LE ? "native DSD" : "PCM",
 				 output.next_sample_rate);
 		output.outfmt = output.next_fmt;
@@ -396,9 +423,15 @@ void _pa_open(void) {
 		err = 1;
 
 #if ANDROID_DSD
-	} else if (output.outfmt == DSD_U16_LE) {
-		// native DSD goes to an AudioTrack, not portaudio
+	} else if (output.outfmt == DSD_U16_LE || (output.outfmt == PCM && pcm_writer_takes(output.current_sample_rate))) {
+		// native DSD goes to an AudioTrack, not portaudio, and so does PCM on Android 8.1 (pcm_writer)
 		dsd_writer_start(false);
+		output.error_opening = false;
+		return;
+	} else if (output.outfmt == DSD_U32_LE) {
+		// native DSD through HiBy's track (pcm_writer); after it failed, the rest of this track is held
+		// silent, and later ones are decoded to PCM
+		dsd_writer_start(!sas_on || sas_dsd_refused);
 		output.error_opening = false;
 		return;
 #endif
@@ -692,6 +725,54 @@ static bool route_takes(const unsigned rates[], unsigned rate) {
 	return false;
 }
 
+// the output formats this player uses, for the log
+static const char *fmt_name(dsd_format fmt) {
+	return fmt == PCM ? "PCM" : fmt == DSD_U16_LE ? "native DSD" : "DoP";
+}
+
+// called with the lock held. Whether a track decoded for the old route, as fmt at rate (from its own
+// rate raw, in the codec LMS sent it in), would not play right on the new route's rates. PCM: at a
+// rate the route does not take, or resampled although the route takes its own rate. DSD sent as DSD,
+// native or as PCM: at every route change, as native DSD into a USB DAC is silent, DSD as PCM where
+// native DSD now plays is the wrong path, and its PCM rate was picked for the old route. DoP is left
+// as upstream plays it
+static bool track_stale(dsd_format fmt, unsigned rate, unsigned raw, char codec, const unsigned rates[]) {
+	if (fmt == DSD_U16_LE || codec == 'd') {
+		return true;
+	}
+	return fmt == PCM && rate && (!route_takes(rates, rate) || (raw && raw != rate && route_takes(rates, raw)));
+}
+
+// called with the lock held, the route just changed: whether a track in the buffer would not play
+// right on the new route (track_stale). The buffer holds the rest of the track playing (current_*) up
+// to track_start, and from there the next track, decoded ahead (next_*): LMS streams one track ahead
+// at most, and a full flush clears track_start (just after it empties the buffer, so a change in that
+// moment can judge the flushed track, and ask for a restart LMS, stopping or starting a track, does
+// not need). While decode_newstream has the lock released, a new stream's rate is being picked from
+// the rates before this change, so that stream is stale too. With nothing in the buffer and no stream
+// starting there is nothing to judge
+static bool route_stale(const unsigned rates[]) {
+	if (output.next_unset) {
+		LOG_INFO("route change while the next track's rate is picked for the old route: restart");
+		return true;
+	}
+	if (_buf_used(outputbuf) && output.track_start != outputbuf->readp &&
+		track_stale(output.outfmt, output.current_sample_rate, output.current_raw_rate, output.current_codec, rates)) {
+		LOG_INFO("track playing (%s at %u, own rate %u, codec %c) does not suit the new route: restart",
+				 fmt_name(output.outfmt), output.current_sample_rate, output.current_raw_rate,
+				 output.current_codec ? output.current_codec : '?');
+		return true;
+	}
+	if (output.track_start &&
+		track_stale(output.next_fmt, output.next_sample_rate, output.next_raw_rate, output.next_codec, rates)) {
+		LOG_INFO("next track, decoded ahead (%s at %u, own rate %u, codec %c), does not suit the new route: restart",
+				 fmt_name(output.next_fmt), output.next_sample_rate, output.next_raw_rate,
+				 output.next_codec ? output.next_codec : '?');
+		return true;
+	}
+	return false;
+}
+
 // android.c, from the Java audio device callback: whether the route takes native DSD, and the
 // PCM rates it takes. The FiiO's own DAC takes DSD; a USB DAC the FiiO routes to does not, and
 // its HAL hides that: the DSD track writes fine into a USB output that never opens (silence), and
@@ -702,19 +783,18 @@ static bool route_takes(const unsigned rates[], unsigned rate) {
 // plays silent (the HAL retries the open). So while one is attached, dac_rates (highest first, 0
 // terminated) replace the player's own, and later tracks are resampled to one of them (decoders
 // read output.supported_rates at each track start). NULL restores the player's own.
-// Returns whether the PCM track playing runs at a rate the new route would not give it, so that
-// Library has LMS stream it again: a rate the route cannot take (a USB DAC plugged in), or one it
-// was resampled to although the route takes its own rate (the DAC unplugged). A DSD track is
-// Library's to judge (it restarts every one), so native DSD output returns false.
+// Returns whether a track in the buffer, decoded for the old route, would not play right on the new
+// one (route_stale), so that Library has LMS stream the track playing again: LMS then streams the
+// tracks after it again too, and they are all decoded for the new route.
 bool output_route_pa(bool dsd_ok, const unsigned dac_rates[]) {
 	const unsigned *rates = dac_rates ? dac_rates : own_rates;
-	unsigned raw;
-	bool pcm_stale;
+	bool changed = false, stale = false;
 	LOCK;
 	if (dsd_route_ok != dsd_ok) {
 		LOG_INFO("output route %s native DSD", dsd_ok ? "takes" : "does not take");
 		dsd_route_ok = dsd_ok;
 		dsd_route_gen++;
+		changed = true;
 	}
 	output.dsdfmt = dsd_ok && !dsd_refused ? DSD_U16_LE : PCM;
 	if (memcmp(output.supported_rates, rates, sizeof(output.supported_rates))) {
@@ -725,16 +805,13 @@ bool output_route_pa(bool dsd_ok, const unsigned dac_rates[]) {
 			sprintf(list + strlen(list), " %u", rates[i]);
 		}
 		LOG_INFO("output rates (%s):%s", dac_rates ? "USB DAC" : "player", list);
+		changed = true;
 	}
-	raw = output.current_raw_rate;
-	pcm_stale = output.outfmt == PCM && output.current_sample_rate &&
-				(!route_takes(rates, output.current_sample_rate) ||
-				 (raw && raw != output.current_sample_rate && route_takes(rates, raw)));
-	if (pcm_stale) {
-		LOG_INFO("PCM track at %u (own rate %u) is not at the rate the new route gives it", output.current_sample_rate, raw);
+	if (changed) {
+		stale = route_stale(rates);
 	}
 	UNLOCK;
-	return pcm_stale;
+	return stale;
 }
 
 static bool dsd_open_track(unsigned rate) {
@@ -865,19 +942,189 @@ static void *dsd_writer(void *arg) {
 	return NULL;
 }
 
+/*
+ PCM on Android 8.1 (pcm_track_on). The HiBy R5 plays 48k and up on a direct output with a 192 frame
+ period, and OpenSL ES, which cannot set the size of the AudioTrack it plays through, gets the minimum
+ there: 388 frames, about 2ms at 176.4k, which underran every few seconds. Java and OpenSL ES also stop
+ at 192k. This thread writes the PCM, as dsd_writer writes DSD, to one of two tracks:
+ - on the R5, HiBy's own (sas_on, android.c sas_track_*), from 32k to 384k, the way HiBy Music plays: on
+   the R5's offload output, as 32-bit integers, which squeezelite's frames already are. Native DSD
+   (DSD_U32_LE, up to DSD256) goes there too, see sas_dsd_pack;
+ - otherwise a Java AudioTrack from 48k to 192k, as floats, with a PCM_TRACK_MS buffer. Below 48k the
+   R5 mixes, and PCM stays on OpenSL ES, whose track there is a fast one (384 frames, at real-time
+   priority) on the low latency output. A Java track cannot ask for that output and would go to the
+   primary one, whose writer was the one stuck when the R5's driver deadlocked under AAudio.
+ A failed open or write hands the stream to the next of HiBy's track, the Java one and portaudio,
+ until the player restarts.
+ */
+extern bool pcm_track_open(unsigned rate, unsigned buffer_frames, unsigned chunk_frames);
+extern bool pcm_track_write(const float *buf, unsigned frames);
+extern int sas_track_open(unsigned rate, bool dsd);
+extern bool sas_track_write(const u8_t *buf, unsigned bytes);
+extern void sas_track_close(void);
+// Native DSD through HiBy's track: squeezelite's DSD_U32_LE frames hold, per channel,
+// b0 << 24 | b1 << 16 | b2 << 8 | b3 (b0 the earliest byte, each byte MSB first). HiBy's track runs at
+// the DSD rate / 32 and its HAL takes the bytes interleaved, earliest first, MSB first: L b0, R b0,
+// L b1, R b1 ... (found by ear on the R5, dsdtest-28: every 32-bit word order played as static)
+static void sas_dsd_pack(const u32_t *in, u8_t *out, frames_t frames) {
+	frames_t i;
+	unsigned k;
+	for (i = 0; i < frames; i++, in += 2) {
+		for (k = 0; k < 4; k++) {
+			*out++ = in[0] >> (24 - 8 * k);
+			*out++ = in[1] >> (24 - 8 * k);
+		}
+	}
+}
+
+#define SAS_AHEAD_S 10 // seconds HiBy's writes may run ahead of the clock (its buffers) before its track is judged dead
+
+static void *pcm_writer(void *arg) {
+	static u32_t frames_buf[DSD_CHUNK_FRAMES * 2]; // one writer at a time: dsd_writer_stop joins it
+	static float floats[DSD_CHUNK_FRAMES * 2];
+	static u8_t packed[DSD_CHUNK_FRAMES * BYTES_PER_FRAME];
+	unsigned rate = pa.rate;
+	bool sas = pcm_sas;                        // HiBy's track, else a Java AudioTrack
+	bool dsd = pa.fmt == DSD_U32_LE;           // native DSD, through HiBy's track
+	u64_t written = 0;                         // frames handed to the track
+	u64_t played = 0;                          // frames it has played: the Java one's 32-bit playback head, unwrapped
+	u64_t latency = 0;                         // HiBy's latency in frames: its track has no playback head
+	u32_t head = 0;
+	u32_t opened = gettime_ms();
+	bool reopen = false, drain = false;
+	bool ok;
+	unsigned i;
+
+	// the priority OpenSL ES runs its AudioTrack callback thread at (ANDROID_PRIORITY_AUDIO)
+	if (setpriority(PRIO_PROCESS, 0, -16)) {
+		LOG_DEBUG("PCM writer priority not raised: %s", strerror(errno));
+	}
+
+	if (sas) {
+		int ms = sas_track_open(rate, dsd);
+		ok = ms >= 0;
+		latency = ms > 0 ? (u64_t)ms * rate / 1000 : 0;
+	} else {
+		ok = pcm_track_open(rate, rate * PCM_TRACK_MS / 1000, DSD_CHUNK_FRAMES);
+	}
+	if (ok) {
+		send_output_format_to_app(dsd, dsd ? rate * 32 : rate);
+	}
+
+	while (ok && dsd_running) {
+		frames_t wanted = DSD_CHUNK_FRAMES, got;
+
+		if (sas) {
+			played = written > latency ? written - latency : 0;
+		} else {
+			u32_t pos = dsd_track_position();
+			played += (u32_t)(pos - head);
+			head = pos;
+		}
+
+		LOCK;
+		output.device_frames = written > played ? (unsigned)(written - played) : 0;
+		output.updated = gettime_ms();
+		output.frames_played_dmp = output.frames_played;
+		optr = (u8_t *)frames_buf;
+		do {
+			got = _output_frames(wanted);
+			wanted -= got;
+			if (dsd_writer_done(false, 0)) break;
+		} while (wanted > 0 && got != 0);
+		if (wanted > 0) {
+			memset(optr, dsd ? 0x69 : 0, wanted * BYTES_PER_FRAME); // DSD or PCM silence
+		}
+		if (output.state == OUTPUT_OFF) {
+			reopen = true;
+		} else if (dsd_writer_done(false, 0)) {
+			reopen = drain = true; // the next track needs another output
+		}
+		UNLOCK;
+
+		if (sas) {
+			if (dsd) {
+				sas_dsd_pack(frames_buf, packed, DSD_CHUNK_FRAMES);
+			}
+			ok = sas_track_write(dsd ? packed : (u8_t *)frames_buf, DSD_CHUNK_FRAMES * BYTES_PER_FRAME);
+			// its write returns what was asked whatever the track did: one that does not play shows
+			// as writes running ahead of the clock
+			if (ok && written + DSD_CHUNK_FRAMES > (u64_t)(gettime_ms() - opened) * rate / 1000 + (u64_t)rate * SAS_AHEAD_S) {
+				LOG_ERROR("HiBy track: writes run %u s ahead of the clock", SAS_AHEAD_S);
+				ok = false;
+			}
+		} else {
+			for (i = 0; i < DSD_CHUNK_FRAMES * 2; i++) { // as portaudio converts paInt32 to paFloat32
+				floats[i] = (float)(s32_t)frames_buf[i] * (1.0f / 2147483648.0f);
+			}
+			ok = pcm_track_write(floats, DSD_CHUNK_FRAMES);
+		}
+		written += DSD_CHUNK_FRAMES;
+		if (reopen) break;
+	}
+
+	if (ok && drain) {
+		// closing the track drops what it holds: let the end of this one play out first
+		u64_t left, most = sas ? rate : (u64_t)rate * PCM_TRACK_MS / 1000;
+		if (sas) {
+			left = latency;
+		} else {
+			u32_t pos = dsd_track_position();
+			played += (u32_t)(pos - head);
+			left = written > played ? written - played : 0;
+		}
+		if (left > most) left = most;
+		usleep(left * 1000000 / rate + 20000);
+	}
+	if (sas) {
+		sas_track_close();
+	} else {
+		dsd_track_close();
+	}
+
+	LOCK;
+	if (!ok && dsd && !sas_dsd_refused) {
+		// as dsd_fall_back: later tracks decode to PCM (dsd.c reads output.dsdfmt at each track start)
+		LOG_ERROR("HiBy DSD track failed: DSD plays as PCM until the player restarts");
+		sas_dsd_refused = true;
+		output.dsdfmt = PCM;
+	} else if (!ok && sas && !dsd && !sas_refused) {
+		LOG_ERROR("HiBy track failed: PCM plays through the AudioTrack or OpenSL ES until the player restarts");
+		sas_refused = true;
+	} else if (!ok && !sas && !pcm_track_refused) {
+		LOG_ERROR("PCM AudioTrack failed: PCM plays through OpenSL ES until the player restarts");
+		pcm_track_refused = true;
+	}
+	if ((reopen || !ok) && dsd_running) {
+		// ended itself: hand the output back as portaudio does when its stream finishes
+		LOG_INFO("PCM output finished");
+		output.pa_reopen = true;
+		wake_controller();
+	}
+	dsd_running = false;
+	UNLOCK;
+	return NULL;
+}
+
 // called with the output lock held. hold: no output at all, the writer only paces the buffer
 static void dsd_writer_start(bool hold) {
+	bool pcm = !hold && (output.outfmt == PCM || output.outfmt == DSD_U32_LE); // pcm_writer
 	pa.rate = output.current_sample_rate;
 	pa.fmt = output.outfmt;
 	pa.dsd = true;
+	pcm_sas = pcm && (output.outfmt == DSD_U32_LE || pcm_sas_takes(pa.rate));
 	dsd_hold = hold;
 	dsd_running = true;
 	if (hold) {
 		LOG_INFO("output hold at %u", pa.rate);
+	} else if (output.outfmt == DSD_U32_LE) {
+		LOG_INFO("native DSD output at %u (DSD%u) through HiBy's track", pa.rate, pa.rate * 32 / 44100);
+	} else if (pcm) {
+		LOG_INFO("PCM output at %u through %s", pa.rate, pcm_sas ? "HiBy's track" : "an AudioTrack");
 	} else {
 		LOG_INFO("native DSD output at %u (DSD%u)", pa.rate, pa.rate * 16 / 44100);
 	}
-	pthread_create(&dsd_thread, NULL, dsd_writer, NULL);
+	pthread_create(&dsd_thread, NULL, pcm ? pcm_writer : dsd_writer, NULL);
 }
 
 // called with the output lock held; the writer needs the lock to finish
@@ -922,6 +1169,14 @@ void output_init_pa(log_level level, const char *device, unsigned output_buf_siz
 	memset(&output, 0, sizeof(output));
 #if ANDROID_DSD
 	dsd_refused = false;
+	pcm_track_refused = false;
+	sas_refused = false;
+	sas_dsd_refused = false;
+	if (sas_on) {
+		LOG_INFO("PCM from %u to %u plays through HiBy's track", SAS_MIN_RATE, SAS_MAX_RATE);
+	} else if (pcm_track_on) {
+		LOG_INFO("PCM from %u up plays through an AudioTrack with a %u ms buffer", PCM_TRACK_MIN_RATE, PCM_TRACK_MS);
+	}
 #endif
 
 #ifndef PA18API

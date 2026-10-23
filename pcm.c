@@ -227,6 +227,7 @@ static decode_state pcm_decode(void) {
 				output.next_fmt = DOP;
 			output.next_sample_rate = sample_rate;
 			output.fade = FADE_INACTIVE;
+			decode_stream_info(sample_rate);
 		} else {
 			output.next_sample_rate = decode_newstream(sample_rate, output.supported_rates);
 			output.next_fmt = PCM;
